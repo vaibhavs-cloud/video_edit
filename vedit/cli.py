@@ -374,9 +374,10 @@ def _deliver(ctx: Ctx) -> None:
     qc_result = _qc_result(ctx)
     meta = st.load_model(ctx.state / "meta.json", StateMeta)
     source_dur = st.load_json(ctx.state / "probe.json")["dur"]
+    state_ref = meta.ref[:8]  # reply to this message to target this run in a fix
     caption = (
         f"edit ready · {qc_result.stats.get('expected_output_s', 0):.0f}s from {source_dur:.0f}s · "
-        f"QC {'PASS' if qc_result.passed else 'FAIL'}"
+        f"QC {'PASS' if qc_result.passed else 'FAIL'} · state {state_ref}"
     )
     tg = Telegram()
     size = final.stat().st_size if final.exists() else 0
@@ -394,7 +395,7 @@ def _deliver(ctx: Ctx) -> None:
         tg.send_photo(ctx.chat_id, sheet)
     tg.send_message(
         ctx.chat_id,
-        f"full video is {size / 1e6:.0f}MB (Telegram cap 50MB) — run state `{meta.ref}`",
+        f"full video is {size / 1e6:.0f}MB (Telegram cap 50MB) — state {state_ref}",
     )
     _log("[deliver] oversized: sent preview + contact sheet")
 

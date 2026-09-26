@@ -1,0 +1,17 @@
+# Reference config for local dev (`npx wrangler dev`) and for reading.
+# Production deploy goes through the Cloudflare MCP (personal account);
+# secrets are set there, never in this file.
+#
+# Required Cloudflare secrets (secret_text):
+#   TELEGRAM_BOT_TOKEN, TELEGRAM_SECRET_PATH, TELEGRAM_SECRET_TOKEN,
+#   GH_TOKEN, ALLOWED_CHAT_ID
+# Non-secret vars:
+#   GH_OWNER=vaibhavs-cloud  GH_REPO=video_edit
+
+name = "vedit-relay"
+main = "worker.mjs"
+compatibility_date = "2026-09-01"
+
+[vars]
+GH_OWNER = "vaibhavs-cloud"
+GH_REPO = "video_edit"

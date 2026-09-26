@@ -3,6 +3,9 @@ pydantic==2.13.5
 PyYAML==6.0.3
 httpx==0.28.1
 gdown==6.4.0
-svglib[bitmaps]==2.2.0
+# Windows has no rsvg-convert, so it needs the rlPyCairo bitmap backend;
+# Linux CI uses librsvg (rsvg-convert) and must not build pycairo from source.
+svglib==2.2.0; sys_platform != "win32"
+svglib[bitmaps]==2.2.0; sys_platform == "win32"
 reportlab==5.0.1
 pillow==12.3.0

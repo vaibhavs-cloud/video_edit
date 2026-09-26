@@ -116,6 +116,10 @@ jobs:
           if [ "$KIND" = "fix" ]; then
             python -m vedit fix --state out/run --instruction "$INSTRUCTION" --chat-id "$CHAT_ID"
           else
+            if [ -z "$IN_URL" ] && [ -z "$IN_FILE_ID" ]; then
+              echo "::error::kind=new requires url or video_file_id"
+              exit 1
+            fi
             INPUT=""
             if [ -n "$IN_URL" ]; then INPUT="$IN_URL"; fi
             if [ -n "$IN_FILE_ID" ]; then INPUT="tg:$IN_FILE_ID"; fi

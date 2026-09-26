@@ -28,6 +28,10 @@ def _is_drive(url: str) -> bool:
 
 def acquire(input_ref: str, dest: Path, cfg: Config) -> tuple[Path, str]:
     """Returns (local_path, source_kind)."""
+    if not input_ref or not input_ref.strip():
+        raise AcquireError(
+            "no source provided: pass a Drive/direct URL, tg:<file_id>, or local path"
+        )
     dest.parent.mkdir(parents=True, exist_ok=True)
 
     if input_ref.startswith("tg:"):

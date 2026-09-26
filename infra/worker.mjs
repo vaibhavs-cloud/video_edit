@@ -36,20 +36,22 @@ export default {
       return new Response("bad json", { status: 400 });
     }
 
+    let result = "ok";
     try {
       await handleUpdate(update, env);
     } catch (err) {
       const chatId = update?.message?.chat?.id ?? update?.edited_message?.chat?.id;
+      result = `relay error: ${String(err?.message || err).slice(0, 300)}`;
       if (chatId) {
         try {
-          await sendText(env, chatId, `relay error: ${String(err?.message || err).slice(0, 300)}`);
+          await sendText(env, chatId, result);
         } catch {
           // never turn a notify failure into a Telegram retry loop
         }
       }
     }
     // always 200: Telegram retries non-2xx, and we already handled the failure
-    return new Response("ok", { status: 200 });
+    return new Response(result, { status: 200 });
   },
 };
 
@@ -165,6 +167,7 @@ async function dispatch(env, inputs) {
         Authorization: `Bearer ${env.GH_TOKEN}`,
         Accept: "application/vnd.github+json",
         "Content-Type": "application/json",
+        "User-Agent": "vedit-relay", // GitHub API rejects requests without one
       },
       body: JSON.stringify({ ref: "main", inputs: normalizedInputs(inputs) }),
     },

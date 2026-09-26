@@ -51,6 +51,21 @@ def build_lines(plan: EditPlan, cfg: Config) -> list[CaptionLine]:
     lines: list[CaptionLine] = []
 
     for span in plan.captions:
+        if span.override_text:
+            first, last = span.from_word, span.to_word
+            out_start = timeline.to_output(plan.words[first].s)
+            out_end = timeline.to_output(plan.words[last].e)
+            lines.append(
+                CaptionLine(
+                    start=out_start,
+                    end=max(out_start + 0.4, out_end),
+                    text_plain=span.override_text,
+                    text_ass=span.override_text,
+                    word_indices=tuple(range(first, last + 1)),
+                )
+            )
+            continue
+
         chunk: list[int] = []
         width = 0
 

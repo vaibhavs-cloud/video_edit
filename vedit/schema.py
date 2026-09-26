@@ -86,6 +86,7 @@ class CaptionSpan(BaseModel):
     from_word: int = Field(ge=0)
     to_word: int = Field(ge=0)
     emphasis: list[int] = Field(default_factory=list)
+    override_text: str | None = None  # set by a recaption fix (correction loop)
 
     @model_validator(mode="after")
     def _check(self) -> CaptionSpan:

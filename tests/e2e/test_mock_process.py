@@ -45,19 +45,56 @@ def test_mock_process_passes_qc(tmp_path):
     assert main(["qc", "--state", str(state), *CFG]) == 0
 
 
-def test_fix_reruns_from_plan(tmp_path):
+def test_fix_patches_without_replan(tmp_path):
     assert main(_process(tmp_path, "fixrun")) == 0
     state = tmp_path / "fixrun"
-    before = json.loads((state / "qc.json").read_text(encoding="utf-8"))
-    assert before["passed"] is True
+    before = json.loads((state / "edit_plan.json").read_text(encoding="utf-8"))
+    assert json.loads((state / "qc.json").read_text(encoding="utf-8"))["passed"] is True
 
-    rc = main(["fix", "--state", str(state), "--instruction", "fewer visuals", *CFG])
+    rc = main(
+        ["fix", "--state", str(state), "--instruction", "remove the first visual", *CFG]
+    )
     assert rc == 0
-    plan = json.loads((state / "edit_plan.json").read_text(encoding="utf-8"))
-    assert plan["prompt"].endswith("CORRECTION: fewer visuals")
+    after = json.loads((state / "edit_plan.json").read_text(encoding="utf-8"))
+    assert after["prompt"] == before["prompt"], "fix must never re-plan"
+    assert len(after["visuals"]) == len(before["visuals"]) - 1
     assert json.loads((state / "qc.json").read_text(encoding="utf-8"))["passed"] is True
     for stage in ("plan", "visuals", "captions", "render", "qc", "report"):
         assert (state / f".done.{stage}").exists()
+
+
+def test_fix_unknown_op_is_rejected_without_render(tmp_path):
+    assert main(_process(tmp_path, "fixunk")) == 0
+    state = tmp_path / "fixunk"
+    plan_before = (state / "edit_plan.json").read_text(encoding="utf-8")
+    qc_before = (state / "qc.json").read_text(encoding="utf-8")
+
+    rc = main(["fix", "--state", str(state), "--instruction", "make it sparkle", *CFG])
+    assert rc == 0
+    assert (state / "edit_plan.json").read_text(encoding="utf-8") == plan_before
+    assert (state / "qc.json").read_text(encoding="utf-8") == qc_before
+
+
+def test_fix_replace_icon_updates_plan(tmp_path):
+    assert main(_process(tmp_path, "fixicon")) == 0
+    state = tmp_path / "fixicon"
+    before = json.loads((state / "edit_plan.json").read_text(encoding="utf-8"))
+    rc = main(
+        [
+            "fix",
+            "--state",
+            str(state),
+            "--instruction",
+            "use a shield instead",
+            *CFG,
+        ]
+    )
+    assert rc == 0
+    after = json.loads((state / "edit_plan.json").read_text(encoding="utf-8"))
+    assert after["prompt"] == before["prompt"]
+    shielded = [v for v in after["visuals"] if v.get("keyword") == "shield"]
+    assert len(shielded) >= 1
+    assert json.loads((state / "qc.json").read_text(encoding="utf-8"))["passed"] is True
 
 
 def test_deliver_requires_chat_id(tmp_path):

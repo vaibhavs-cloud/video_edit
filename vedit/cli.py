@@ -18,10 +18,11 @@ from vedit import ff
 from vedit import state as st
 from vedit.acquire import acquire, verify_media
 from vedit.config import Config, load_config
-from vedit.schema import EditPlan, PlanDraft, Segment, StateMeta, Transcript
+from vedit.schema import EditPlan, FixOp, PlanDraft, Segment, StateMeta, Transcript
 from vedit.stage import audio as audio_stage
 from vedit.stage import captions as captions_stage
 from vedit.stage import cuts, render, transcribe
+from vedit.stage import fix as fix_stage
 from vedit.stage import plan as plan_stage
 from vedit.stage import qc as qc_stage
 from vedit.stage import report as report_stage
@@ -37,6 +38,16 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
+def _notify(chat_id: str, text: str) -> None:
+    """Best-effort user-facing message (fix rejections, hints). Never raises."""
+    try:
+        from vedit.telegram_client import Telegram
+
+        Telegram().send_message(chat_id, text[:4000])
+    except Exception as exc:  # noqa: BLE001 — a failed hint must not kill the run
+        _log(f"[notify] failed: {exc}")
+
+
 @dataclass
 class Ctx:
     state: Path
@@ -45,6 +56,7 @@ class Ctx:
     prompt: str
     input_ref: str
     chat_id: str
+    repick: list[str] | None = None  # visual ids to re-pick on a fix run
 
     @property
     def work(self) -> Path:
@@ -263,14 +275,30 @@ def s_visuals(ctx: Ctx) -> None:
                     resolved.append(ResolvedVisual(visual=v, asset=path))
         st.save_model(ctx.state / "edit_plan.json", plan)
     else:
+        repick = None if ctx.repick is None else set(ctx.repick)
+        targets = [
+            v
+            for v in plan.visuals
+            if v.kind == "icon" and (repick is None or v.id in repick)
+        ]
+        target_ids = {v.id for v in targets}
         picks: dict[str, str | None] = {}
         try:
-            shortlists = visuals_stage.shortlists(plan.visuals, ctx.cfg)
+            shortlists = visuals_stage.shortlists(targets, ctx.cfg)
             picks = visuals_stage.pick_icons(shortlists, ctx.cfg)
+            if repick is not None:
+                # explicit user request: never silently drop the replacement
+                for vid, candidates in shortlists.items():
+                    if not picks.get(vid) and candidates:
+                        picks[vid] = candidates[0]
+                        _log(
+                            f"[visuals] pick model returned none for {vid} "
+                            f"-> top candidate {candidates[0]}"
+                        )
         except Exception as exc:  # noqa: BLE001 — iconify outage degrades visuals, not the run
             _log(f"[visuals] shortlist/pick failed, continuing without icons: {exc}")
         for v in plan.visuals:
-            if v.kind == "icon" and picks.get(v.id):
+            if v.id in target_ids and v.kind == "icon" and picks.get(v.id):
                 v.icon = picks[v.id]
         st.save_model(ctx.state / "edit_plan.json", plan)
         resolved = visuals_stage.resolve_visuals(
@@ -472,17 +500,38 @@ def cmd_process(args: argparse.Namespace) -> int:
 
 
 def cmd_fix(args: argparse.Namespace) -> int:
+    """Structured correction loop (implementation.md §9): patch, never re-plan."""
     cfg = load_config(args.config)
     ff.require_tools()
     state = Path(args.state)
     plan = st.load_model(state / "edit_plan.json", EditPlan)
-    prompt = (plan.prompt + "\n\nCORRECTION: " + args.instruction).strip()
-    ctx = _ctx_from_state(state, cfg, prompt, args.chat_id or "")
-    st.clear_from(state, "plan")
+    ctx = _ctx_from_state(state, cfg, plan.prompt, args.chat_id or "")
+    transcript = _load_transcript(ctx)
     _log(f"[fix] {args.instruction}")
-    # start at acquire so a fresh CI checkout re-derives source+audio; the
-    # preserved transcribe/cut markers make it skip straight to planning
-    _run_stages(ctx, "acquire")
+
+    try:
+        patch = fix_stage.parse_fix(
+            args.instruction, plan, transcript, cfg, mock=ctx.mock
+        )
+        new_plan, notes = fix_stage.apply_patch(patch, plan, transcript)
+    except fix_stage.FixError as exc:
+        _log(f"[fix] {exc}")
+        if ctx.chat_id:
+            _notify(ctx.chat_id, str(exc))
+        return 0  # handled: state untouched, run stays chainable
+
+    st.save_model(state / "edit_plan.json", new_plan)
+    notes_file = state / "notes.json"
+    existing = st.load_json(notes_file) if notes_file.exists() else []
+    st.save_json(notes_file, existing + notes)
+    st.mark_done(state, "plan")  # never let a missing marker re-plan over the patch
+    st.clear_from(state, "visuals")  # icons/manifest/captions/render must rebuild
+    ctx.repick = (
+        [patch.visual_id] if patch.op == FixOp.replace_icon and patch.visual_id else []
+    )
+    _log(f"[fix] {patch.op.value} applied — re-rendering")
+
+    _run_stages(ctx, "acquire")  # transcribe/cut/plan skipped by markers
 
     qc_passed = _qc_result(ctx).passed
     if ctx.chat_id and qc_passed:

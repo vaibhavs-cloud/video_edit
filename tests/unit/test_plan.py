@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import time
+
 from vedit.schema import DraftCaption, DraftVisual, PlanDraft
-from vedit.stage.plan import assemble_plan
+from vedit.stage import plan as plan_stage
+from vedit.stage.plan import _fallback_draft, assemble_plan, draft_plan
 
 
 def test_visual_crossing_cut_is_dropped_with_note(
@@ -107,3 +110,31 @@ def test_reframe_mode_picks_crop_for_landscape_source(cfg, transcript, segments)
         "",
     )
     assert built.reframe.mode == "crop"
+
+
+def test_fallback_draft_validates(transcript, segments):
+    draft = _fallback_draft(transcript, segments)
+    assert isinstance(draft, PlanDraft)
+    assert len(draft.captions) == len(segments)
+    assert draft.visuals == []
+    assert draft.zoom_at_words == []
+    assert all(isinstance(c, DraftCaption) for c in draft.captions), (
+        "fallback must emit PlanDraft's own caption type"
+    )
+
+
+def test_draft_plan_degrades_instead_of_crashing(
+    monkeypatch, cfg, transcript, segments
+):
+    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
+    monkeypatch.setattr(
+        plan_stage,
+        "generate_json",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("quota")),
+    )
+    monkeypatch.setattr(time, "sleep", lambda *_: None)
+    draft, degraded, note = draft_plan(transcript, segments, [], cfg, "", 65.0)
+    assert degraded is True
+    assert isinstance(draft, PlanDraft)
+    assert len(draft.captions) == len(segments)
+    assert "plan failed" in note

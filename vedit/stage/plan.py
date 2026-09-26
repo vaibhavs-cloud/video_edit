@@ -17,6 +17,7 @@ from pydantic import BaseModel, ValidationError
 from vedit.config import Config
 from vedit.schema import (
     CaptionSpan,
+    DraftCaption,
     EditPlan,
     PlanDraft,
     Reframe,
@@ -132,7 +133,9 @@ def _fallback_draft(transcript: Transcript, segments: list[Segment]) -> PlanDraf
     return PlanDraft(
         visuals=[],
         captions=[
-            CaptionSpan(from_word=s.keep_from_word, to_word=s.keep_to_word, emphasis=[])
+            DraftCaption(
+                from_word=s.keep_from_word, to_word=s.keep_to_word, emphasis=[]
+            )
             for s in segments
         ],
         zoom_at_words=[],

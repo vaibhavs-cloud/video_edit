@@ -233,9 +233,10 @@ def s_plan(ctx: Ctx) -> None:
     )
     st.save_model(ctx.state / "edit_plan.json", plan)
     st.save_json(ctx.state / "notes.json", notes)
+    degraded_note = f" (degraded: {note})" if degraded and note else ""
     _log(
         f"[plan] {len(plan.segments)} segments, {len(plan.visuals)} visuals, "
-        f"{len(plan.captions)} caption spans"
+        f"{len(plan.captions)} caption spans{degraded_note}"
     )
 
 

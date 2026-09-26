@@ -9,6 +9,7 @@
 1. **LLM provider switched to Groq** (`config.yaml models.provider: groq`: `whisper-large-v3` + `openai/gpt-oss-120b`) — Gemini's free tier turned out to be **20 requests/day** for `gemini-3.5-flash`, exhausted within one build day. Gemini stays fully supported behind the same `vedit/llm.py` abstraction (swap `models.provider`); all model IDs remain config knobs.
 2. **Correction loop implemented as specified in §9** (structured `FixOp` patch, never re-plans) rather than an intermediate re-plan-with-instruction version used during early testing.
 3. Icon pick "none" outcomes are spec-compliant (best-of-8-or-none); an *explicit user-requested* icon replacement falls back to Iconify's top candidate so a fix never silently renders nothing.
+4. **Worker dispatch pins `User-Agent: vedit-relay`** — Cloudflare Workers `fetch` sends no User-Agent and the GitHub REST API 403s without one (found live 2026-09-26, fixed + redeployed, dispatch verified). `edit.yml` also fails fast on `kind=new` with neither `url` nor `video_file_id`, and `acquire()` rejects empty sources with a clear error instead of an `IsADirectoryError`.
 
 ---
 

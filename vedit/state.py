@@ -63,12 +63,15 @@ def run_stage(state: Path, stage: str, fn: Callable[[], Any]) -> Any:
     return out
 
 
-def ensure_state(out_root: Path, name: str) -> Path:
-    state = out_root / name
+def ensure_dirs(state: Path) -> Path:
     state.mkdir(parents=True, exist_ok=True)
     (state / "work").mkdir(exist_ok=True)
     (state / "icons").mkdir(exist_ok=True)
     return state
+
+
+def ensure_state(out_root: Path, name: str) -> Path:
+    return ensure_dirs(out_root / name)
 
 
 def save_json(path: Path, data: Any) -> None:

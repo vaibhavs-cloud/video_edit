@@ -124,6 +124,7 @@ def fetch_icon(icon_id: str, cfg: Config, cache_dir: Path) -> Path:
     prefix, _, name = icon_id.partition(":")
     if not name:
         raise VisualsError(f"malformed icon id: {icon_id}")
+    cache_dir.mkdir(parents=True, exist_ok=True)
     svg_path = cache_dir / f"{prefix}-{name}.svg"
     png_path = cache_dir / f"{prefix}-{name}-{cfg.visuals.icon_size}.png"
 

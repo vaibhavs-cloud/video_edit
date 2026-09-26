@@ -431,6 +431,7 @@ def cmd_attach(args: argparse.Namespace) -> int:
 
 def _ctx_from_state(state: Path, cfg: Config, prompt: str, chat_id: str) -> Ctx:
     meta = st.load_model(state / "meta.json", StateMeta)
+    st.ensure_dirs(state)  # downloaded CI state lacks empty dirs (icons/, work/)
     return Ctx(
         state=state,
         cfg=cfg,

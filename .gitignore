@@ -1,0 +1,23 @@
+# Secrets — never commit
+keys.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+
+# Pipeline working dirs
+work/
+out/
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# opencode local state
+.opencode/

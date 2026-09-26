@@ -1,0 +1,81 @@
+{
+  "visuals": [
+    {
+      "kind": "icon",
+      "keyword": "database",
+      "from_word": 10,
+      "to_word": 19,
+      "pos": "top-right",
+      "zoom": false
+    },
+    {
+      "kind": "icon",
+      "keyword": "shield",
+      "from_word": 40,
+      "to_word": 49,
+      "pos": "top-left",
+      "zoom": false
+    },
+    {
+      "kind": "icon",
+      "keyword": "route",
+      "from_word": 70,
+      "to_word": 79,
+      "pos": "top",
+      "zoom": true
+    }
+  ],
+  "captions": [
+    {
+      "from_word": 0,
+      "to_word": 9,
+      "emphasis": [
+        8
+      ]
+    },
+    {
+      "from_word": 10,
+      "to_word": 19,
+      "emphasis": []
+    },
+    {
+      "from_word": 20,
+      "to_word": 29,
+      "emphasis": [
+        24
+      ]
+    },
+    {
+      "from_word": 30,
+      "to_word": 39,
+      "emphasis": []
+    },
+    {
+      "from_word": 40,
+      "to_word": 49,
+      "emphasis": [
+        42
+      ]
+    },
+    {
+      "from_word": 50,
+      "to_word": 59,
+      "emphasis": []
+    },
+    {
+      "from_word": 60,
+      "to_word": 69,
+      "emphasis": [
+        65
+      ]
+    },
+    {
+      "from_word": 70,
+      "to_word": 79,
+      "emphasis": []
+    }
+  ],
+  "zoom_at_words": [
+    14
+  ]
+}

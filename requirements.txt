@@ -1,0 +1,8 @@
+google-genai==2.25.0
+pydantic==2.13.5
+PyYAML==6.0.3
+httpx==0.28.1
+gdown==6.4.0
+svglib[bitmaps]==2.2.0
+reportlab==5.0.1
+pillow==12.3.0

@@ -1,0 +1,37 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ffmpeg and librsvg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg librsvg2-bin
+
+      - name: Assert ASS filter available
+        run: ffmpeg -filters | grep -q ass
+
+      - name: Install Python deps
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: |
+          ruff check vedit tests tools
+          ruff format --check vedit tests tools
+
+      - name: Unit + mock E2E tests
+        run: python -m pytest -q

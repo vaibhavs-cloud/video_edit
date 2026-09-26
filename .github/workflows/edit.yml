@@ -1,0 +1,181 @@
+name: edit
+
+on:
+  workflow_dispatch: # Worker + manual "Run workflow" share these inputs
+    inputs:
+      kind:
+        description: "new | fix"
+        type: string
+        required: true
+        default: "new"
+      chat_id:
+        description: "Telegram chat id for delivery"
+        type: string
+        required: true
+      url:
+        description: "Drive/direct link (kind=new)"
+        type: string
+        default: ""
+      video_file_id:
+        description: "Telegram video file_id (kind=new, <=20MB)"
+        type: string
+        default: ""
+      attachments:
+        description: "JSON array of screenshot file_ids"
+        type: string
+        default: "[]"
+      prompt:
+        description: "Owner instruction for the edit"
+        type: string
+        default: ""
+      state_ref:
+        description: "state sha8 (kind=fix)"
+        type: string
+        default: ""
+      instruction:
+        description: "Correction text (kind=fix)"
+        type: string
+        default: ""
+
+concurrency:
+  group: vedit-${{ inputs.chat_id || 'manual' }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read # cross-run state artifact download on kind=fix
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install ffmpeg and librsvg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg librsvg2-bin
+
+      - name: Assert ASS filter available
+        run: ffmpeg -filters | grep -q ass
+
+      - name: Install Python deps
+        run: python -m pip install -r requirements.txt
+
+      - name: Download prior state (kind=fix)
+        if: inputs.kind == 'fix'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STATE_REF: ${{ inputs.state_ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$STATE_REF" ]; then
+            echo "::error::kind=fix requires state_ref"
+            exit 1
+          fi
+          ART=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts?name=state-$STATE_REF")
+          ID=$(jq -r '.artifacts[0].id // empty' <<<"$ART")
+          if [ -z "$ID" ]; then
+            echo "::error::no state artifact state-$STATE_REF"
+            exit 1
+          fi
+          curl -sfL -H "Authorization: Bearer $GH_TOKEN" -o /tmp/state.zip \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip"
+          mkdir -p out/run
+          unzip -oq /tmp/state.zip -d out/run
+
+      - name: Download Telegram attachments
+        if: inputs.attachments != '' && inputs.attachments != '[]'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ATTACHMENTS: ${{ inputs.attachments }}
+        run: python -m vedit attach --state out/run --file-ids "$ATTACHMENTS"
+
+      - name: Run pipeline
+        id: run
+        continue-on-error: true
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          KIND: ${{ inputs.kind }}
+          IN_URL: ${{ inputs.url }}
+          IN_FILE_ID: ${{ inputs.video_file_id }}
+          IN_PROMPT: ${{ inputs.prompt }}
+          INSTRUCTION: ${{ inputs.instruction }}
+          CHAT_ID: ${{ inputs.chat_id }}
+        run: |
+          set -euo pipefail
+          if [ "$KIND" = "fix" ]; then
+            python -m vedit fix --state out/run --instruction "$INSTRUCTION" --chat-id "$CHAT_ID"
+          else
+            INPUT=""
+            if [ -n "$IN_URL" ]; then INPUT="$IN_URL"; fi
+            if [ -n "$IN_FILE_ID" ]; then INPUT="tg:$IN_FILE_ID"; fi
+            python -m vedit process --input "$INPUT" --out out --name run \
+              --prompt "$IN_PROMPT" --chat-id "$CHAT_ID"
+          fi
+
+      - name: Send failure report to Telegram
+        if: steps.run.outcome == 'failure' && inputs.chat_id != ''
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import httpx
+
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat = os.environ["CHAT_ID"]
+          base = f"https://api.telegram.org/bot{token}"
+          report = pathlib.Path("out/run/edit_report.md")
+          text = "run failed — no video produced"
+          if report.exists():
+              text = report.read_text(encoding="utf-8")[:3500]
+          httpx.post(base + "/sendMessage", json={"chat_id": chat, "text": text}, timeout=60)
+          if report.exists():
+              with report.open("rb") as fh:
+                  httpx.post(
+                      base + "/sendDocument",
+                      data={"chat_id": chat},
+                      files={"document": ("edit_report.md", fh, "text/markdown")},
+                      timeout=120,
+                  )
+          PY
+
+      - name: Compute state ref
+        id: ref
+        if: steps.run.outcome == 'success'
+        run: |
+          SHA=$(jq -r .sha256 out/run/meta.json)
+          echo "sha8=${SHA:0:8}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload state artifact
+        if: steps.run.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: state-${{ steps.ref.outputs.sha8 }}
+          retention-days: 30
+          include-hidden-files: true
+          if-no-files-found: error
+          path: |
+            out/run/*.json
+            out/run/*.md
+            out/run/*.srt
+            out/run/*.ass
+            out/run/.done.transcribe
+            out/run/.done.cut
+            out/run/icons/**
+            out/run/attachments/**
+
+      - name: Fail the job if the pipeline failed
+        if: steps.run.outcome == 'failure'
+        run: exit 1

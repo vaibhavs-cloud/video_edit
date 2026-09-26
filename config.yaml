@@ -1,0 +1,71 @@
+models:
+  transcribe: gemini-3.5-transcribe
+  plan: gemini-3.5-flash
+  visuals: gemini-3.5-flash
+
+cuts:
+  cut_gap_ms: 600
+  keep_gap_ms: 350
+  pad_ms: 120
+  min_kept_segment_ms: 700
+  min_output_s: 40
+  adaptive_multiplier: 1.8
+  pre_roll_ms: 80
+  post_roll_ms: 140
+
+audio:
+  highpass_hz: 80
+  afftdn_nf: -30
+  comp_threshold_db: -18
+  comp_ratio: 3
+  comp_attack_ms: 10
+  comp_release_ms: 200
+  loudnorm_i: -16
+  loudnorm_tp: -1.5
+  loudnorm_lra: 11
+
+video:
+  width: 1080
+  height: 1920
+  fps: 30
+  x_frac: 0.5
+  zoom_factor: 1.06
+  max_zoom_segments_div: 4
+  x264_preset: veryfast
+  x264_crf: 20
+  audio_bitrate: 192k
+
+visuals:
+  prefixes: lucide,ph
+  search_limit: 32
+  shortlist: 8
+  density_window_s: 8
+  max_visuals: 12
+  icon_color: "#FFFFFF"
+  icon_size: 200
+  fade_s: 0.25
+  screenshot_width_frac: 0.9
+
+captions:
+  font: Inter-SemiBold
+  font_size: 64
+  max_chars: 32
+  margin_v: 260
+  primary_color: "&H00FFFFFF"
+  emphasis_color: "&H004AD5FF"
+
+qc:
+  duration_tolerance_s: 0.25
+  min_word_coverage: 0.95
+
+limits:
+  max_output_s: 90
+  max_input_s: 1200
+  telegram_download_max_bytes: 20971520
+  telegram_send_max_bytes: 52428800
+
+retry:
+  llm_attempts: 3
+  llm_backoff_s: 2
+  http_attempts: 3
+  http_backoff_s: 1

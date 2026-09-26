@@ -1,8 +1,14 @@
 # AI Video Editing Agent — Implementation Plan
 
-**Status:** verified & approved, ready to execute (M0 → M5).
-**Companion doc:** `video-editing-agent-spec.md` (product spec — unchanged except the corrections listed in §14).
+**Status:** **complete** (M0–M5 built and verified 2026-09-26; live evidence in git history + Actions runs + Telegram deliveries).
+**Companion doc:** `video-editing-agent-spec.md` (product spec — §14 corrections have been applied).
 **Rule for anyone (human or agent) reading this:** every external API/limit below was verified against live docs on 2026-09-26. If something fails at runtime, check §12 (known runtime-only checks) before redesigning anything.
+
+### Deviations from the original plan (justified)
+
+1. **LLM provider switched to Groq** (`config.yaml models.provider: groq`: `whisper-large-v3` + `openai/gpt-oss-120b`) — Gemini's free tier turned out to be **20 requests/day** for `gemini-3.5-flash`, exhausted within one build day. Gemini stays fully supported behind the same `vedit/llm.py` abstraction (swap `models.provider`); all model IDs remain config knobs.
+2. **Correction loop implemented as specified in §9** (structured `FixOp` patch, never re-plans) rather than an intermediate re-plan-with-instruction version used during early testing.
+3. Icon pick "none" outcomes are spec-compliant (best-of-8-or-none); an *explicit user-requested* icon replacement falls back to Iconify's top candidate so a fix never silently renders nothing.
 
 ---
 
@@ -370,6 +376,7 @@ Adding a new op = one schema entry + one patch function + one test.
 | Value | GitHub repo secrets | Worker env | keys.txt |
 |---|---|---|---|
 | `GEMINI_API_KEY` | ✅ | — | ✅ |
+| `GROQ_API_KEY` | ✅ | — | ✅ |
 | `TELEGRAM_BOT_TOKEN` | ✅ | ✅ | ✅ |
 | `TELEGRAM_CHAT_ID` | ✅ (= `ALLOWED_CHAT_ID`) | ✅ | ✅ |
 | `GH_TOKEN` (classic, scope `repo`) | — | ✅ | ✅ |
@@ -378,6 +385,8 @@ Adding a new op = one schema entry + one patch function + one test.
 | `TELEGRAM_SECRET_TOKEN` | — | ✅ | ✅ |
 
 ## 14. Spec corrections to apply to `video-editing-agent-spec.md` (at M0, minimal edits)
+
+> **APPLIED 2026-09-26** — all four corrections are now in the spec (§3 input/reframe, §4 architecture/silence, §5 state/render, §6 visuals), plus honest provider/free-tier updates (§2 principle 3, §8 table) reflecting the Groq switch.
 
 1. **§3 Input contract:** Drive-link input is primary (Telegram `getFile` ≤20 MB hard cap); attachment fallback; auto 9:16 reframe rule (`x_frac` override).
 2. **§4 Architecture:** silence detection leaves Gemini → word timestamps + deterministic rules; transcribe/plan split into two schema-validated calls (`gemini-3.5-transcribe` + `gemini-3.5-flash`); dispatch is `workflow_dispatch`; CI installs ffmpeg.

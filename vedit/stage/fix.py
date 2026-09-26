@@ -75,7 +75,11 @@ OPS (pick exactly one):
 - remove_visual: drop a visual; set visual_id
 - recaption: replace caption text; set from_word (start of the target caption) + text
 - retime_visual: move a visual in time; set visual_id + from_word + to_word (source word indices)
-- unknown: instruction is not any of the above
+- unknown: the instruction is not about visuals or captions at all
+
+TARGETING: when the instruction names a time or describes a position, pick the
+CLOSEST visual / caption to it — exact matches are not required. Only answer
+unknown when there is genuinely nothing the instruction could refer to.
 
 TIME MAP: each word is [index](start-end seconds). Times in the instruction refer to source time.
 

@@ -80,7 +80,9 @@ def pick_icons(
     prompt = (
         "You pick the single best icon for each concept from a shortlist.\n"
         'Return JSON: {"picks": [{"visual_id": str, "icon": "prefix:name" | null}]}.\n'
-        "Use null when no candidate actually illustrates the concept.\n\n"
+        "Pick the closest loosely-related candidate for EVERY concept; never "
+        "return null unless nothing in the shortlist is even loosely related "
+        "(a plausibly-matching icon beats null in all cases).\n\n"
         + json.dumps(shortlists_map, ensure_ascii=False)
     )
     last: Exception | None = None

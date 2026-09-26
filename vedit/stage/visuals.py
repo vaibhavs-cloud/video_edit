@@ -10,6 +10,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 import httpx
@@ -141,6 +142,7 @@ def resolve_visuals(
     cfg: Config,
     icons_dir: Path,
     attachments_dir: Path | None,
+    on_error: Any = None,
 ) -> list[ResolvedVisual]:
     """Fetch/convert every asset. Unresolvable visuals are dropped, never fatal."""
     limited = apply_limits(visuals, transcript, cfg)
@@ -150,6 +152,8 @@ def resolve_visuals(
             if v.kind == "icon":
                 icon = v.icon or ""
                 if not icon:
+                    if on_error:
+                        on_error(f"[visuals] {v.id}: no icon picked for '{v.keyword}'")
                     continue
                 resolved.append(
                     ResolvedVisual(visual=v, asset=fetch_icon(icon, cfg, icons_dir))
@@ -157,8 +161,11 @@ def resolve_visuals(
             else:
                 path = resolve_screenshot(v.file or "", attachments_dir)
                 if path is None:
+                    if on_error:
+                        on_error(f"[visuals] {v.id}: screenshot '{v.file}' not found")
                     continue
                 resolved.append(ResolvedVisual(visual=v, asset=path))
-        except Exception:  # noqa: BLE001, S110 — one bad asset must not kill the render
-            pass
+        except Exception as exc:  # noqa: BLE001 — one bad asset must not kill the render
+            if on_error:
+                on_error(f"[visuals] {v.id} ({v.kind}) failed: {exc!r}")
     return resolved

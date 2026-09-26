@@ -274,7 +274,7 @@ def s_visuals(ctx: Ctx) -> None:
                 v.icon = picks[v.id]
         st.save_model(ctx.state / "edit_plan.json", plan)
         resolved = visuals_stage.resolve_visuals(
-            plan.visuals, transcript, ctx.cfg, ctx.icons, ctx.attachments
+            plan.visuals, transcript, ctx.cfg, ctx.icons, ctx.attachments, on_error=_log
         )
 
     manifest = [

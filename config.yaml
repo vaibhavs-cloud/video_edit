@@ -65,7 +65,7 @@ limits:
   telegram_send_max_bytes: 52428800
 
 retry:
-  llm_attempts: 3
-  llm_backoff_s: 2
+  llm_attempts: 4
+  llm_backoff_s: 4
   http_attempts: 3
   http_backoff_s: 1

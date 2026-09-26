@@ -119,6 +119,12 @@ edit_plan.json → segments: [{start, end, cuts, visual_query}, ...]
 
 ## 6. Visual strategy (no asset library, ever)
 
+> Project choice (`config.yaml visuals.icons_enabled: false`): **no icon
+> overlays at all — only input images are placed.** The Iconify path below
+> stays implemented behind the flag, but the planner is instructed to emit
+> screenshot-kind visuals only, assembly drops any icon draft with a note,
+> and the correction loop rejects icon replacements.
+
 Concept keywords come from the plan model's structured output (§4). For each keyword:
 
 1. Search Iconify with pinned prefixes (`lucide,ph`) and keep a shortlist of up to 8 candidates (`https://api.iconify.design/search?query=<keyword>&prefixes=lucide,ph` — free, no auth, 200,000+ icons across 200+ open icon sets).

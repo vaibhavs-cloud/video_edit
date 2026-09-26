@@ -57,6 +57,7 @@ class VideoCfg:
 
 @dataclass(frozen=True)
 class VisualsCfg:
+    icons_enabled: bool
     prefixes: str
     search_limit: int
     shortlist: int

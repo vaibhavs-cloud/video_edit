@@ -173,7 +173,10 @@ def _same_segment(plan: EditPlan, lo: int, hi: int) -> bool:
 
 
 def apply_patch(
-    patch: FixPatch, plan: EditPlan, transcript: Transcript
+    patch: FixPatch,
+    plan: EditPlan,
+    transcript: Transcript,
+    icons_enabled: bool = True,
 ) -> tuple[EditPlan, list[str]]:
     """Deterministically patch the plan. Raises FixError for anything unsafe."""
     notes: list[str] = []
@@ -185,6 +188,11 @@ def apply_patch(
         )
 
     if patch.op == FixOp.replace_icon:
+        if not icons_enabled:
+            raise FixError(
+                "icons are disabled in this project — send a screenshot and "
+                "say which visual it should replace"
+            )
         v = _find_visual(plan, patch)
         if patch.keyword:
             v.keyword = patch.keyword

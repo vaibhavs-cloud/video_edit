@@ -23,6 +23,14 @@
       "to_word": 79,
       "pos": "top",
       "zoom": true
+    },
+    {
+      "kind": "screenshot",
+      "file": "diagram.png",
+      "from_word": 30,
+      "to_word": 39,
+      "pos": "top-right",
+      "zoom": false
     }
   ],
   "captions": [

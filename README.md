@@ -105,13 +105,19 @@ Prereqs: `ffmpeg` (with `ass` filter), Python 3.12, Node 24, `git`, `gh`.
 
 6. **Use it from Telegram**
 
+   - (Optional) Send **images first** — each is staged for one hour and the
+     bot confirms `saved image N`. They are attached to your next video/link
+     run and the planner places them where they fit what is being said.
    - Send a **Drive share link** (primary, any size) or a video **≤20 MB**
      (fallback), optionally with free-text instructions.
    - Receive `final.mp4` + report caption ending in `state <sha8>`.
    - **Reply** to that message with a correction:
-     `fix the icon at 0:20, use a shield` · `remove the visual …` ·
-     `recaption 0:45: …` · `move the icon at 0:20 to 0:30`
+     `remove the visual …` · `recaption 0:45: …` ·
+     `move the visual at 0:20 to 0:30`
    - Unsupported instructions get a hint message — nothing re-renders.
+
+   No Iconify icons are ever overlaid (`visuals.icons_enabled: false`):
+   the only on-screen images are the ones you send.
 
 ### CLI (local runs)
 
@@ -131,7 +137,8 @@ stopped; `--from-stage <stage>` forces a re-run from any point.
 
 - `models.provider` — `groq` (default) or `gemini`; model IDs alongside it
 - `cuts` — silence gap rules (600/350 ms, 120 ms pad, adaptive median)
-- `audio`, `video`, `captions`, `visuals` (prefixes, density cap, icon color)
+- `audio`, `video`, `captions`, `visuals` (density cap, screenshot width;
+  `icons_enabled: false` — only input images are placed, never stock icons)
 - `qc` — duration tolerance 0.25 s, caption coverage ≥ 0.95
 - `retry` — LLM/HTTP attempt counts and backoff
 - `limits` — input/output caps, Telegram 20 MB download / 50 MB send

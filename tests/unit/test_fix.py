@@ -7,12 +7,6 @@ from vedit.stage.captions import build_lines
 from vedit.stage.fix import FixError, apply_patch, parse_fix
 
 
-@pytest.fixture
-def edit_plan(plan):
-    built, _ = plan
-    return built
-
-
 def test_replace_icon_clears_and_rekeywords(edit_plan, transcript):
     v0 = edit_plan.visuals[0]
     out, notes = apply_patch(

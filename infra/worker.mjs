@@ -3,6 +3,7 @@
 // POST /tg/<TELEGRAM_SECRET_PATH>  (+ X-Telegram-Bot-Api-Secret-Token check)
 //   reply to a delivered video with text  -> dispatch kind=fix (state_ref + instruction)
 //   text containing a URL                 -> dispatch kind=new (url)
+//   photo / image file                   -> staged in KV, attached to the next run
 //   video attachment <= 20 MB             -> dispatch kind=new (video_file_id)
 //   video attachment > 20 MB              -> reply asking for a Drive link
 //   anything else                         -> usage help
@@ -10,6 +11,7 @@
 //
 // Secrets (Cloudflare secret_text): TELEGRAM_BOT_TOKEN, TELEGRAM_SECRET_PATH,
 // TELEGRAM_SECRET_TOKEN, GH_TOKEN, ALLOWED_CHAT_ID.
+// Bindings: PENDING_IMAGES (KV namespace "vedit-pending-images").
 
 const GITHUB_API = "https://api.github.com";
 const TG_MAX_VIDEO_BYTES = 20 * 1024 * 1024;
@@ -103,8 +105,34 @@ async function handleUpdate(update, env) {
   const urlMatch = text.match(/https?:\/\/\S+/);
   if (urlMatch) {
     const prompt = text.replace(urlMatch[0], "").trim();
-    await dispatch(env, { kind: "new", chat_id: chatId, url: urlMatch[0], prompt });
+    await dispatch(env, {
+      kind: "new",
+      chat_id: chatId,
+      url: urlMatch[0],
+      prompt,
+      attachments: JSON.stringify(await takePending(env, chatId)),
+    });
     await sendText(env, chatId, "queued — processing your link now");
+    return;
+  }
+
+  // 2b) photo / image file -> stage it for the next video/link run
+  const photoSizes = Array.isArray(msg.photo) ? msg.photo : [];
+  const photo = photoSizes.length ? photoSizes[photoSizes.length - 1] : null;
+  const imageDoc =
+    msg.document && /^image\//.test(msg.document.mime_type || "")
+      ? msg.document
+      : null;
+  const image = photo || imageDoc;
+  if (image && !msg.video) {
+    const count = await pushPending(env, chatId, image.file_id);
+    await sendText(
+      env,
+      chatId,
+      `saved image ${count} — now send the video (or a link) and I'll place ${
+        count === 1 ? "it" : "them"
+      } in the edit`,
+    );
     return;
   }
 
@@ -127,6 +155,7 @@ async function handleUpdate(update, env) {
       chat_id: chatId,
       video_file_id: media.file_id,
       prompt: text,
+      attachments: JSON.stringify(await takePending(env, chatId)),
     });
     await sendText(env, chatId, "queued — processing your video now");
     return;
@@ -136,8 +165,44 @@ async function handleUpdate(update, env) {
   await sendText(
     env,
     chatId,
-    "send a Google Drive/direct video link, a video (≤20MB), or reply to a delivered video with a correction.",
+    "send images first (they'll be placed in the edit), then a Google Drive/direct video link, a video (≤20MB), or reply to a delivered video with a correction.",
   );
+}
+
+// Staged input images, buffered in KV between messages (1h TTL).
+// Missing binding -> behave as if no images were staged.
+function pendingKey(chatId) {
+  return `pending:${chatId}`;
+}
+
+async function getPending(env, chatId) {
+  try {
+    if (!env.PENDING_IMAGES) return [];
+    const raw = await env.PENDING_IMAGES.get(pendingKey(chatId));
+    const list = JSON.parse(raw || "[]");
+    return Array.isArray(list) ? list.filter((v) => typeof v === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+async function pushPending(env, chatId, fileId) {
+  const list = await getPending(env, chatId);
+  list.push(fileId);
+  if (env.PENDING_IMAGES) {
+    await env.PENDING_IMAGES.put(pendingKey(chatId), JSON.stringify(list), {
+      expirationTtl: 3600,
+    });
+  }
+  return list.length;
+}
+
+async function takePending(env, chatId) {
+  const list = await getPending(env, chatId);
+  if (env.PENDING_IMAGES && list.length) {
+    await env.PENDING_IMAGES.delete(pendingKey(chatId));
+  }
+  return list;
 }
 
 function normalizedInputs(inputs) {

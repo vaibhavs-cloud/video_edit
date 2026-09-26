@@ -8,7 +8,7 @@ from vedit.stage.plan import _fallback_draft, assemble_plan, draft_plan
 
 
 def test_visual_crossing_cut_is_dropped_with_note(
-    cfg, transcript, segments, source_dur
+    cfg_icons, transcript, segments, source_dur
 ):
     crossing = DraftVisual(
         kind="icon",
@@ -22,7 +22,7 @@ def test_visual_crossing_cut_is_dropped_with_note(
         draft,
         transcript,
         segments,
-        cfg,
+        cfg_icons,
         "",
         {"ref": "t", "sha256": "0" * 64, "w": 10, "h": 10, "dur": source_dur},
         False,
@@ -146,7 +146,7 @@ def _meta(source_dur):
 
 
 def test_single_word_visual_is_widened_not_crashed(
-    cfg, transcript, segments, source_dur
+    cfg_icons, transcript, segments, source_dur
 ):
     w = segments[0].keep_from_word + 1
     draft = PlanDraft(
@@ -155,7 +155,7 @@ def test_single_word_visual_is_widened_not_crashed(
         zoom_at_words=[],
     )
     built, _ = assemble_plan(
-        draft, transcript, segments, cfg, "", _meta(source_dur), False, ""
+        draft, transcript, segments, cfg_icons, "", _meta(source_dur), False, ""
     )
     assert len(built.visuals) == 1
     v = built.visuals[0]
@@ -163,7 +163,7 @@ def test_single_word_visual_is_widened_not_crashed(
 
 
 def test_reversed_and_out_of_range_drafts_never_crash(
-    cfg, transcript, segments, source_dur
+    cfg_icons, transcript, segments, source_dur
 ):
     w = segments[0].keep_from_word + 2
     draft = PlanDraft(
@@ -187,7 +187,7 @@ def test_reversed_and_out_of_range_drafts_never_crash(
         zoom_at_words=[99999],
     )
     built, _ = assemble_plan(
-        draft, transcript, segments, cfg, "", _meta(source_dur), False, ""
+        draft, transcript, segments, cfg_icons, "", _meta(source_dur), False, ""
     )
     assert all(v.to_word > v.from_word for v in built.visuals)
     assert all(c.from_word <= c.to_word for c in built.captions)

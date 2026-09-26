@@ -5,6 +5,8 @@
 # Required Cloudflare secrets (secret_text):
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_SECRET_PATH, TELEGRAM_SECRET_TOKEN,
 #   GH_TOKEN, ALLOWED_CHAT_ID
+# Bindings:
+#   PENDING_IMAGES = KV namespace "vedit-pending-images" (staged input images)
 # Non-secret vars:
 #   GH_OWNER=vaibhavs-cloud  GH_REPO=video_edit
 
@@ -15,3 +17,7 @@ compatibility_date = "2026-09-01"
 [vars]
 GH_OWNER = "vaibhavs-cloud"
 GH_REPO = "video_edit"
+
+[[kv_namespaces]]
+binding = "PENDING_IMAGES"
+id = "f7c38d3fb974456d97783e2c41c61318"

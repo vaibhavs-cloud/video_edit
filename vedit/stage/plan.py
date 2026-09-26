@@ -50,6 +50,20 @@ def _build_prompt(
     kept = sum(s.end - s.start for s in segments)
     max_zoom = max(1, len(segments) // cfg.video.max_zoom_segments_div)
     max_visuals = cfg.visuals.max_visuals
+    if cfg.visuals.icons_enabled:
+        visual_rules = (
+            f"- max {max_visuals} visuals total, never two starting within "
+            f"{cfg.visuals.density_window_s:.0f}s of each other\n"
+            '    - kind "icon": a concrete noun/tech concept (API, token, database, lock...). keyword = the search term.\n'
+            '    - kind "screenshot": ONLY if a listed filename directly illustrates what is being said; set file to that filename.'
+        )
+    else:
+        visual_rules = (
+            '- input images ONLY: kind must always be "screenshot" with file '
+            'set to one of the listed filenames (never kind "icon").\n'
+            "    - place a screenshot ONLY where it directly illustrates what is being said\n"
+            "    - if no listed filename fits (or the list is empty), emit NO visuals at all"
+        )
     return f"""You are the editing planner for a vertical educational Reel (1080x1920).
 
 INPUT
@@ -63,11 +77,9 @@ TRANSCRIPT (each word prefixed with its index)
 
 DECIDE
 1. visuals — concepts that deserve an on-screen element. Rules:
-   - max {max_visuals} visuals total, never two starting within {cfg.visuals.density_window_s:.0f}s of each other
-   - kind "icon": a concrete noun/tech concept (API, token, database, lock...). keyword = the search term.
-   - kind "screenshot": ONLY if a listed filename directly illustrates what is being said; set file to that filename.
-   - range [from_word, to_word] inclusive, must lie inside ONE kept segment
-   - pos: where it sits; zoom: true only for a strong emphasis moment
+{visual_rules}
+    - range [from_word, to_word] inclusive, must lie inside ONE kept segment
+    - pos: where it sits; zoom: true only for a strong emphasis moment
 2. captions — split the talk into readable spans of 1-6 words each.
    - every word of the transcript should be covered by exactly one span
    - each span must lie inside ONE kept segment (never cross a segment boundary)
@@ -190,6 +202,9 @@ def assemble_plan(
     counter = 0
     for dv in draft.visuals:
         lo, hi = dv.from_word, dv.to_word
+        if dv.kind == "icon" and not cfg.visuals.icons_enabled:
+            notes.append(f"dropped visual @{lo}: icons disabled, screenshots only")
+            continue
         if lo >= n_words:
             notes.append(f"dropped visual @{lo}: out of range")
             continue

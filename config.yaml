@@ -37,6 +37,7 @@ video:
   audio_bitrate: 192k
 
 visuals:
+  icons_enabled: false # no Iconify overlays; only input images (screenshots) are placed
   prefixes: lucide,ph
   search_limit: 32
   shortlist: 8

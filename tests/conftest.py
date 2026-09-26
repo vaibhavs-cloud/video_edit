@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -20,6 +21,14 @@ FIXTURES = ROOT / "vedit" / "fixtures"
 @pytest.fixture
 def cfg():
     return load_config(ROOT / "config.yaml")
+
+
+@pytest.fixture
+def cfg_icons(cfg):
+    """Variant with Iconify overlays enabled (icon code path coverage)."""
+    return dataclasses.replace(
+        cfg, visuals=dataclasses.replace(cfg.visuals, icons_enabled=True)
+    )
 
 
 @pytest.fixture
@@ -47,15 +56,21 @@ def segments(cfg, transcript, source_dur):
 
 
 @pytest.fixture
-def plan(cfg, transcript, draft, segments, source_dur):
+def plan(cfg_icons, transcript, draft, segments, source_dur):
     built, notes = plan_stage.assemble_plan(
         draft,
         transcript,
         segments,
-        cfg,
+        cfg_icons,
         "unit test",
         {"ref": "test", "sha256": "0" * 64, "w": 1280, "h": 720, "dur": source_dur},
         False,
         "",
     )
     return built, notes
+
+
+@pytest.fixture
+def edit_plan(plan):
+    built, _ = plan
+    return built

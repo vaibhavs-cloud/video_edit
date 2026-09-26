@@ -259,7 +259,7 @@ def s_visuals(ctx: Ctx) -> None:
 
     if ctx.mock:
         for v in plan.visuals:
-            if v.kind == "icon":
+            if v.kind == "icon" and ctx.cfg.visuals.icons_enabled:
                 v.icon = f"mock:{v.keyword or v.id}"
                 resolved.append(
                     ResolvedVisual(
@@ -281,6 +281,10 @@ def s_visuals(ctx: Ctx) -> None:
             for v in plan.visuals
             if v.kind == "icon" and (repick is None or v.id in repick)
         ]
+        if not ctx.cfg.visuals.icons_enabled and targets:
+            # legacy plans may still carry icons; never pick new ones when off
+            _log("[visuals] icons disabled — skipping icon pick")
+            targets = []
         target_ids = {v.id for v in targets}
         picks: dict[str, str | None] = {}
         try:
@@ -513,7 +517,9 @@ def cmd_fix(args: argparse.Namespace) -> int:
         patch = fix_stage.parse_fix(
             args.instruction, plan, transcript, cfg, mock=ctx.mock
         )
-        new_plan, notes = fix_stage.apply_patch(patch, plan, transcript)
+        new_plan, notes = fix_stage.apply_patch(
+            patch, plan, transcript, icons_enabled=ctx.cfg.visuals.icons_enabled
+        )
     except fix_stage.FixError as exc:
         _log(f"[fix] {exc}")
         if ctx.chat_id:

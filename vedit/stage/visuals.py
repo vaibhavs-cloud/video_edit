@@ -16,9 +16,9 @@ from urllib.parse import quote
 import httpx
 
 from vedit.config import Config
+from vedit.llm import generate_json, make_client, missing_key
 from vedit.schema import IconPicks, Transcript, Visual
 from vedit.stage.assets import render_svg_to_png, resolve_screenshot
-from vedit.stage.plan import generate_json
 
 
 class VisualsError(RuntimeError):
@@ -73,14 +73,10 @@ def pick_icons(
         return {vid: mock.get(vid) for vid in shortlists_map}
     if not shortlists_map:
         return {}
-    import os
-
-    if not os.environ.get("GEMINI_API_KEY"):
+    if missing_key(cfg):
         return {vid: None for vid in shortlists_map}
 
-    from google import genai
-
-    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+    client = make_client(cfg)
     prompt = (
         "You pick the single best icon for each concept from a shortlist.\n"
         'Return JSON: {"picks": [{"visual_id": str, "icon": "prefix:name" | null}]}.\n'
@@ -90,7 +86,7 @@ def pick_icons(
     last: Exception | None = None
     for attempt in range(1, cfg.retry.llm_attempts + 1):
         try:
-            raw = generate_json(client, cfg.models.visuals, prompt, IconPicks)
+            raw = generate_json(client, cfg, cfg.models.visuals, prompt, IconPicks)
             picks = IconPicks.model_validate_json(
                 raw.strip().removeprefix("```json").removesuffix("```").strip()
             )

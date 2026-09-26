@@ -1,7 +1,8 @@
 models:
-  transcribe: gemini-3.5-transcribe
-  plan: gemini-3.5-flash
-  visuals: gemini-3.5-flash
+  provider: groq
+  transcribe: whisper-large-v3
+  plan: openai/gpt-oss-120b
+  visuals: openai/gpt-oss-120b
 
 cuts:
   cut_gap_ms: 600

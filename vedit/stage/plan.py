@@ -1,4 +1,4 @@
-"""Gemini call 2: word-indexed transcript -> PlanDraft (visuals/captions/zooms).
+"""LLM call 2: word-indexed transcript -> PlanDraft (visuals/captions/zooms).
 
 The model never emits cut times. Its output is JSON-Schema constrained,
 validated, repaired once on failure, and finally degraded to captions-only —
@@ -10,11 +10,12 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any, TypeVar
+from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 from vedit.config import Config
+from vedit.llm import generate_json, make_client, missing_key
 from vedit.schema import (
     CaptionSpan,
     DraftCaption,
@@ -76,46 +77,6 @@ DECIDE
 Answer with raw JSON only, matching the provided schema."""
 
 
-def generate_json(client: Any, model: str, prompt: str, schema: type[T]) -> str:
-    from google.genai import types
-
-    schema_json = schema.model_json_schema()
-    attempt_configs: list[Any]
-    try:
-        attempt_configs = [
-            {
-                "response_format": {
-                    "type": "text",
-                    "mime_type": "application/json",
-                    "schema": schema_json,
-                }
-            },
-            types.GenerateContentConfig(
-                response_mime_type="application/json", response_schema=schema_json
-            ),
-        ]
-    except Exception:  # noqa: BLE001 — pragma: no cover — SDK shape differences
-        attempt_configs = [
-            types.GenerateContentConfig(
-                response_mime_type="application/json", response_schema=schema_json
-            )
-        ]
-
-    last: Exception | None = None
-    for cfg_item in attempt_configs:
-        try:
-            resp = client.models.generate_content(
-                model=model, contents=prompt, config=cfg_item
-            )
-            text = resp.text
-            if text:
-                return text
-        except (TypeError, ValueError) as exc:
-            last = exc
-            continue
-    raise PlanError(f"could not call model with structured output: {last}")
-
-
 def _strip_fences(text: str) -> str:
     text = text.strip()
     if text.startswith("```"):
@@ -151,17 +112,15 @@ def draft_plan(
     source_dur: float,
 ) -> tuple[PlanDraft, bool, str]:
     """Returns (draft, degraded, note). Never raises for model/validation issues."""
-    api_key = __import__("os").environ.get("GEMINI_API_KEY", "")
-    if not api_key:
+    key = missing_key(cfg)
+    if key:
         return (
             _fallback_draft(transcript, segments),
             True,
-            "GEMINI_API_KEY not set -> captions-only",
+            f"{key} not set -> captions-only",
         )
 
-    from google import genai
-
-    client = genai.Client(api_key=api_key)
+    client = make_client(cfg)
     prompt = _build_prompt(
         transcript, segments, screenshots, cfg, user_prompt, source_dur
     )
@@ -176,7 +135,7 @@ def draft_plan(
                     errors[:8]
                 )
                 effective += "\nReturn corrected raw JSON only."
-            raw = generate_json(client, cfg.models.plan, effective, PlanDraft)
+            raw = generate_json(client, cfg, cfg.models.plan, effective, PlanDraft)
             draft = _parse(raw, PlanDraft)
             return draft, False, ""
         except (ValidationError, json.JSONDecodeError) as exc:
@@ -226,46 +185,58 @@ def assemble_plan(
     notes: list[str] = []
     if note:
         notes.append(note)
+    n_words = len(transcript.words)
     visuals: list[Visual] = []
     counter = 0
     for dv in draft.visuals:
-        segs = {
-            _segment_index(segments, wi)
-            for wi in range(
-                dv.from_word, min(dv.to_word, len(transcript.words) - 1) + 1
-            )
-        }
-        if None in segs or len(segs) != 1 or dv.from_word >= len(transcript.words):
-            notes.append(
-                f"dropped visual @{dv.from_word}: crosses a cut or is out of range"
-            )
+        lo, hi = dv.from_word, dv.to_word
+        if lo >= n_words:
+            notes.append(f"dropped visual @{lo}: out of range")
             continue
-        counter += 1
-        visuals.append(
-            Visual(
-                id=f"v{counter}",
-                kind=dv.kind,
-                keyword=dv.keyword,
-                file=dv.file,
-                from_word=dv.from_word,
-                to_word=dv.to_word,
-                pos=dv.pos,
-                zoom=dv.zoom,
+        if hi <= lo:
+            hi = lo + 1  # model asked for a single word: widen to survive schema
+        hi = min(hi, n_words - 1)
+        if hi <= lo:
+            notes.append(f"dropped visual @{lo}: empty range at transcript end")
+            continue
+        segs = {_segment_index(segments, wi) for wi in range(lo, hi + 1)}
+        if None in segs or len(segs) != 1:
+            notes.append(f"dropped visual @{lo}: crosses a cut or is out of range")
+            continue
+        try:
+            counter += 1
+            visuals.append(
+                Visual(
+                    id=f"v{counter}",
+                    kind=dv.kind,
+                    keyword=dv.keyword,
+                    file=dv.file,
+                    from_word=lo,
+                    to_word=hi,
+                    pos=dv.pos,
+                    zoom=dv.zoom,
+                )
             )
-        )
+        except ValidationError as exc:  # never let a draft quirk crash assembly
+            counter -= 1
+            notes.append(f"dropped visual @{lo}: {exc.errors()[0]['msg']}")
 
     captions: list[CaptionSpan] = []
     for dc in draft.captions:
-        if dc.from_word >= len(transcript.words):
+        lo, hi = dc.from_word, min(dc.to_word, n_words - 1)
+        if lo >= n_words or hi < lo:
             continue
-        if _segment_index(segments, dc.from_word) == _segment_index(
-            segments, dc.to_word
-        ):
-            captions.append(
-                CaptionSpan(
-                    from_word=dc.from_word, to_word=dc.to_word, emphasis=dc.emphasis
+        if _segment_index(segments, lo) == _segment_index(segments, hi):
+            try:
+                captions.append(
+                    CaptionSpan(
+                        from_word=lo,
+                        to_word=hi,
+                        emphasis=[e for e in dc.emphasis if lo <= e <= hi],
+                    )
                 )
-            )
+            except ValidationError:
+                captions.append(CaptionSpan(from_word=lo, to_word=hi))
             continue
         # split a caption that straddles a cut into per-segment spans
         for seg in segments:

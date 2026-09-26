@@ -126,6 +126,7 @@ def test_fallback_draft_validates(transcript, segments):
 def test_draft_plan_degrades_instead_of_crashing(
     monkeypatch, cfg, transcript, segments
 ):
+    monkeypatch.setenv("GROQ_API_KEY", "test-key")
     monkeypatch.setenv("GEMINI_API_KEY", "test-key")
     monkeypatch.setattr(
         plan_stage,
@@ -138,3 +139,59 @@ def test_draft_plan_degrades_instead_of_crashing(
     assert isinstance(draft, PlanDraft)
     assert len(draft.captions) == len(segments)
     assert "plan failed" in note
+
+
+def _meta(source_dur):
+    return {"ref": "t", "sha256": "0" * 64, "w": 10, "h": 10, "dur": source_dur}
+
+
+def test_single_word_visual_is_widened_not_crashed(
+    cfg, transcript, segments, source_dur
+):
+    w = segments[0].keep_from_word + 1
+    draft = PlanDraft(
+        visuals=[DraftVisual(kind="icon", keyword="focus", from_word=w, to_word=w)],
+        captions=[],
+        zoom_at_words=[],
+    )
+    built, _ = assemble_plan(
+        draft, transcript, segments, cfg, "", _meta(source_dur), False, ""
+    )
+    assert len(built.visuals) == 1
+    v = built.visuals[0]
+    assert v.from_word == w and v.to_word == w + 1
+
+
+def test_reversed_and_out_of_range_drafts_never_crash(
+    cfg, transcript, segments, source_dur
+):
+    w = segments[0].keep_from_word + 2
+    draft = PlanDraft(
+        visuals=[
+            DraftVisual(kind="icon", keyword="x", from_word=w, to_word=1),
+            DraftVisual(
+                kind="icon",
+                keyword="y",
+                from_word=len(transcript.words) + 5,
+                to_word=len(transcript.words) + 9,
+            ),
+        ],
+        captions=[
+            DraftCaption(from_word=9, to_word=3, emphasis=[99]),
+            DraftCaption(
+                from_word=segments[0].keep_from_word,
+                to_word=segments[0].keep_from_word + 2,
+                emphasis=[5000],
+            ),
+        ],
+        zoom_at_words=[99999],
+    )
+    built, _ = assemble_plan(
+        draft, transcript, segments, cfg, "", _meta(source_dur), False, ""
+    )
+    assert all(v.to_word > v.from_word for v in built.visuals)
+    assert all(c.from_word <= c.to_word for c in built.captions)
+    assert all(
+        c.from_word <= e <= c.to_word for c in built.captions for e in c.emphasis
+    )
+    assert all(0 <= z < len(transcript.words) for z in built.zoom_at_words)

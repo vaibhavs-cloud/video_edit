@@ -14,6 +14,7 @@ class ModelsCfg:
     transcribe: str
     plan: str
     visuals: str
+    provider: str = "gemini"
 
 
 @dataclass(frozen=True)

@@ -1,20 +1,15 @@
 # Blockers (need the owner)
 
-## 1. SAMPLE_VIDEO_URL never supplied — real Drive-link path untested
+## 1. ~~SAMPLE_VIDEO_URL never supplied — real Drive-link path untested~~ RESOLVED 2026-09-27
 
-- What is missing: a Google Drive "anyone with the link" URL of a real
-  20–90 s talking-head recording (the mission's `SAMPLE_VIDEO_URL`).
-- Consequence: the **Drive-link input path** (`gdown` branch in
-  `vedit/acquire.py`) has never run against a real Drive file. All live
-  runs used either a direct HTTPS release asset or a Telegram attachment.
-  The `gdown` call itself is standard usage (`fuzzy=True`) and the
-  surrounding pipeline is proven, but a first real-Drive run should be
-  watched once a link exists.
-- Related untested branch: the worker's **>20 MB attachment → "send a
-  Drive link"** reply (no >20 MB video was ever sent to the bot).
-- How to unblock: paste a Drive share link in chat (or send it to the
-  bot) — the bot will dispatch `kind=new` with `url=` and the run needs
-  no further input.
+- Owner supplied a real Drive link; run `36310143423` downloaded it via
+  `gdown` (`[acquire] url source 1280x720 94.2s`), cut 94.2s → 86.9s kept,
+  QC PASS, `final.mp4` (40.1MB) delivered to Telegram.
+- First attempt failed on `TypeError: download() got an unexpected keyword
+  argument 'fuzzy'` (gdown 6.x removed it) — fixed in `vedit/acquire.py`
+  with a regression test pinning kwargs to the installed signature.
+- Still untested: the worker's **>20 MB attachment → "send a Drive link"**
+  reply (no >20 MB video was ever sent to the bot).
 
 ## 2. Resolved during this session (kept for the record)
 

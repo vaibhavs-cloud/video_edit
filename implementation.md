@@ -11,6 +11,7 @@
 3. Icon pick "none" outcomes are spec-compliant (best-of-8-or-none); an *explicit user-requested* icon replacement falls back to Iconify's top candidate so a fix never silently renders nothing.
 4. **Worker dispatch pins `User-Agent: vedit-relay`** — Cloudflare Workers `fetch` sends no User-Agent and the GitHub REST API 403s without one (found live 2026-09-26, fixed + redeployed, dispatch verified). `edit.yml` also fails fast on `kind=new` with neither `url` nor `video_file_id`, and `acquire()` rejects empty sources with a clear error instead of an `IsADirectoryError`.
 5. **Screenshots-only visuals** (owner request 2026-09-26): `visuals.icons_enabled: false` (config knob, default off). The plan prompt allows screenshot-kind visuals only, `assemble_plan` drops icon drafts with a note, the visuals stage never calls Iconify when off (including for legacy plans), and `replace_icon` fixes are rejected with a hint. Input images reach the bot via KV staging (`vedit-pending-images` namespace, 1 h TTL): send photos first, then the video/link; the worker attaches the staged file_ids to the dispatched run.
+6. **Silence assist + `add_visual`** (owner report 2026-09-27: multi-second pauses survived cutting): whisper stretches word timings across real pauses, so word spans are now cross-checked against `silencedetect` on the RAW track (`ff.detect_silences`, merged intervals) before the gap rules run — silent parts are subtracted (longest speaking piece kept), zero-energy words dropped. Also fixed a float-boundary flake in `_merge_tiny` that glued 0.70s islands back (re-admitting pauses), and lowered `min_kept_segment_ms` 700 → 500. Verified on the owner's recording: worst in-segment pause 5.9s → 0.12s, kept 86.9s → ~70s. New `add_visual` fix op places a staged input image at a named time/phrase (`place diagram.png at 0:20`); silence re-cuts stay unsupported by fixes (deterministic settings, tuned not patched).
 
 ---
 
@@ -329,7 +330,7 @@ steps:
 2. Worker → `workflow_dispatch` (`kind=fix`, `state_ref`, `instruction`).
 3. Job downloads `state-<sha8>`, re-derives source from `meta.json` (Drive URL / `file_id`).
 4. **Gemini call (small, structured)** maps free text → patch op enum:
-   `replace_icon | remove_visual | recaption | retime_visual | unknown`
+    `replace_icon | remove_visual | recaption | retime_visual | add_visual | unknown`
    (`unknown` → bot replies with supported phrasings, **no render**).
 5. Patch `edit_plan.json` (re-validated), re-run stages G–I. Transcription & plan untouched.
    Segments are re-rendered in full (deterministic; unchanged segments come out identical) — cross-run byte-reuse is a documented future optimization, not an MVP dependency.

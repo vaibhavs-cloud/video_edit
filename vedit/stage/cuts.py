@@ -7,14 +7,20 @@ word-level transcript timings:
     gap <= keep_gap_ms                -> keep
     in between                        -> adaptive vs speaking rate (median gap * multiplier)
 
-Cut boundaries sit in the silence *between* words, padded by pad_ms, so they
-can never clip speech. Leading/trailing dead air beyond pre/post roll is also
-trimmed. All functions here are pure — easy to unit test.
+Because whisper stretches word timings across real pauses (hiding them from
+the gap rules), word spans are first cross-checked against energy-based
+silence intervals (`correct_words`): the silent part is subtracted and the
+longest speaking piece kept; words with no energy anywhere in their span are
+dropped as phantom timestamps. Cut boundaries sit in the silence *between* words,
+padded by pad_ms, so they can never clip speech. Leading/trailing dead air
+beyond pre/post roll is also trimmed. All functions here are pure —
+easy to unit test.
 """
 
 from __future__ import annotations
 
 import statistics
+from dataclasses import replace
 
 from vedit.config import CutsCfg
 from vedit.schema import Segment, Word
@@ -22,6 +28,49 @@ from vedit.schema import Segment, Word
 
 class CutsError(ValueError):
     pass
+
+
+def correct_words(
+    words: list[Word], silences: list[tuple[float, float]], cfg: CutsCfg
+) -> tuple[list[Word], dict]:
+    """Shrink word spans around detected silences; drop phantom words.
+
+    Returns (corrected_words, {"shrunk": n, "dropped": n}). Indices are
+    reassigned 0..n so every downstream stage stays consistent — call this
+    before anything else consumes word indices.
+    """
+    pad = cfg.silence_pad_ms / 1000.0
+    spans = [(max(0.0, a - pad), b + pad) for a, b in silences if b > a]
+    kept: list[Word] = []
+    shrunk = dropped = 0
+    for w in words:
+        dur = w.e - w.s
+        pieces = [(w.s, w.e)]
+        for a, b in spans:
+            rest: list[tuple[float, float]] = []
+            for s, e in pieces:
+                if b <= s or a >= e:
+                    rest.append((s, e))
+                    continue
+                if a > s:
+                    rest.append((s, min(a, e)))
+                if b < e:
+                    rest.append((max(b, s), e))
+            pieces = rest
+        pieces = [(s, e) for s, e in pieces if e - s >= 0.02]
+        if not pieces:
+            # No energy anywhere in the span: a phantom timestamp, unless the
+            # word is so short this may be detector jitter.
+            if dur >= cfg.word_drop_min_s:
+                dropped += 1
+                continue
+            kept.append(Word(i=len(kept), s=w.s, e=w.e, t=w.t))
+            continue
+        best = max(pieces, key=lambda p: p[1] - p[0])
+        if (best[0], best[1]) != (w.s, w.e):
+            shrunk += 1
+        kept.append(Word(i=len(kept), s=round(best[0], 3), e=round(best[1], 3), t=w.t))
+    return kept, {"shrunk": shrunk, "dropped": dropped}
 
 
 def _cut_flags(words: list[Word], cfg: CutsCfg) -> list[bool]:
@@ -45,12 +94,21 @@ def _cut_flags(words: list[Word], cfg: CutsCfg) -> list[bool]:
 def _merge_tiny(
     segments: list[tuple[float, float]], min_dur: float
 ) -> list[tuple[float, float]]:
-    """Folding sub-minimum segments into their neighbour keeps the cut rhythm natural."""
+    """Folding sub-minimum segments into their neighbour keeps the cut rhythm natural.
+
+    The epsilon matters: bounds are float arithmetic on rounded word times, so
+    a 0.70s island must not read as 0.6999s and get glued back (re-admitting
+    the pause the cut just removed).
+    """
     if not segments:
         return segments
+    eps = 1e-6
     merged = [segments[0]]
     for seg in segments[1:]:
-        if seg[1] - seg[0] < min_dur or merged[-1][1] - merged[-1][0] < min_dur:
+        if (
+            seg[1] - seg[0] < min_dur - eps
+            or merged[-1][1] - merged[-1][0] < min_dur - eps
+        ):
             merged[-1] = (merged[-1][0], seg[1])
         else:
             merged.append(seg)
@@ -102,16 +160,7 @@ def compute_segments(words: list[Word], dur: float, cfg: CutsCfg) -> list[Segmen
     intervals, kept = _intervals(words, cfg, dur, _cut_flags(words, cfg))
     if kept < cfg.min_output_s:
         # Too aggressive for this recording: cut only unambiguous dead air once.
-        relaxed = CutsCfg(
-            cut_gap_ms=int(cfg.cut_gap_ms * 1.6),
-            keep_gap_ms=cfg.keep_gap_ms,
-            pad_ms=cfg.pad_ms,
-            min_kept_segment_ms=cfg.min_kept_segment_ms,
-            min_output_s=cfg.min_output_s,
-            adaptive_multiplier=cfg.adaptive_multiplier,
-            pre_roll_ms=cfg.pre_roll_ms,
-            post_roll_ms=cfg.post_roll_ms,
-        )
+        relaxed = replace(cfg, cut_gap_ms=int(cfg.cut_gap_ms * 1.6))
         intervals, kept = _intervals(words, relaxed, dur, _cut_flags(words, relaxed))
 
     segments: list[Segment] = []

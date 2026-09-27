@@ -96,3 +96,54 @@ def duration_of(info: dict) -> float:
         if s.get("duration"):
             return float(s["duration"])
     raise FFmpegError("could not determine duration")
+
+
+def detect_silences(
+    path: str | Path, noise_db: float, min_dur_s: float, merge_gap_s: float
+) -> list[tuple[float, float]]:
+    """Energy-based silence intervals via silencedetect (stderr, info level).
+
+    Run this on the RAW (pre-loudnorm) track: loudness normalisation lifts
+    the noise floor and hides real pauses. Nearby intervals separated by less
+    than merge_gap_s are fused (breath-level dips split long pauses).
+    """
+    stderr = run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-i",
+            str(path),
+            "-af",
+            f"silencedetect=noise={noise_db}dB:d={min_dur_s}",
+            "-vn",
+            "-f",
+            "null",
+            "-",
+        ],
+        timeout=900,
+    )
+    starts: list[float] = []
+    intervals: list[tuple[float, float]] = []
+    for line in stderr.splitlines():
+        line = line.strip()
+        if "silence_start:" in line:
+            try:
+                starts.append(float(line.split("silence_start:")[1].split()[0]))
+            except ValueError:
+                continue
+        elif "silence_end:" in line and starts:
+            try:
+                end = float(line.split("silence_end:")[1].split()[0])
+            except ValueError:
+                starts.pop()
+                continue
+            start = starts.pop()
+            if end > start:
+                intervals.append((start, end))
+    merged: list[list[float]] = []
+    for start, end in sorted(intervals):
+        if merged and start - merged[-1][1] < merge_gap_s:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+    return [(s, e) for s, e in merged]

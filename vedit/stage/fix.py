@@ -12,7 +12,7 @@ import time
 
 from vedit.config import Config
 from vedit.llm import generate_json, make_client, missing_key
-from vedit.schema import EditPlan, FixOp, FixPatch, Transcript
+from vedit.schema import EditPlan, FixOp, FixPatch, Transcript, Visual
 from vedit.stage.plan import _words_inline
 
 
@@ -21,9 +21,11 @@ class FixError(RuntimeError):
 
 
 SUPPORTED = (
-    'supported fixes: replace the icon ("use a shield") · remove the visual · '
-    'recaption a span ("recaption 0:45: ...") · retime a visual '
-    '("move the icon at 0:20 to 0:30")'
+    'supported fixes: place an input image ("place diagram.png at 0:20") · '
+    'remove the visual · recaption a span ("recaption 0:45: ...") · '
+    'retime a visual ("move the visual at 0:20 to 0:30"). '
+    "Silence cutting is automatic — a fix can't re-cut; report surviving "
+    "pauses and the cut settings get tuned instead."
 )
 
 
@@ -67,7 +69,12 @@ def _caption_rows(plan: EditPlan, transcript: Transcript) -> list[dict]:
     return rows
 
 
-def _build_prompt(instruction: str, plan: EditPlan, transcript: Transcript) -> str:
+def _build_prompt(
+    instruction: str,
+    plan: EditPlan,
+    transcript: Transcript,
+    screenshots: list[str],
+) -> str:
     return f"""You map ONE correction instruction to a single structured patch op.
 
 OPS (pick exactly one):
@@ -75,16 +82,19 @@ OPS (pick exactly one):
 - remove_visual: drop a visual; set visual_id
 - recaption: replace caption text; set from_word (start of the target caption) + text
 - retime_visual: move a visual in time; set visual_id + from_word + to_word (source word indices)
+- add_visual: place an input image; set file (exactly one of AVAILABLE SCREENSHOTS) + from_word + to_word (source word indices, inside one segment)
 - unknown: the instruction is not about visuals or captions at all
 
 TARGETING: when the instruction names a time or describes a position, pick the
 CLOSEST visual / caption to it — exact matches are not required. Only answer
-unknown when there is genuinely nothing the instruction could refer to.
+unknown when there is genuinely nothing the instruction could refer to. For
+add_visual, map a named time or quoted phrase to the closest word indices.
 
 TIME MAP: each word is [index](start-end seconds). Times in the instruction refer to source time.
 
 CURRENT VISUALS: {json.dumps(_visual_rows(plan, transcript), ensure_ascii=False)}
 CURRENT CAPTIONS: {json.dumps(_caption_rows(plan, transcript), ensure_ascii=False)}
+AVAILABLE SCREENSHOTS: {json.dumps(screenshots, ensure_ascii=False)}
 WORDS: {_words_inline(transcript)}
 
 INSTRUCTION: {instruction}
@@ -92,7 +102,7 @@ INSTRUCTION: {instruction}
 Answer with raw JSON only, matching the provided schema."""
 
 
-def _mock_patch(instruction: str, plan: EditPlan) -> FixPatch:
+def _mock_patch(instruction: str, plan: EditPlan, screenshots: list[str]) -> FixPatch:
     text = instruction.lower()
     first_icon = next((v for v in plan.visuals if v.kind == "icon"), None)
     if "remove" in text and plan.visuals:
@@ -100,6 +110,14 @@ def _mock_patch(instruction: str, plan: EditPlan) -> FixPatch:
     if ("shield" in text or "use a" in text) and first_icon:
         kw = "shield" if "shield" in text else text.split("use a ")[-1].split()[0]
         return FixPatch(op=FixOp.replace_icon, visual_id=first_icon.id, keyword=kw)
+    if ("place" in text or "add" in text) and screenshots and plan.captions:
+        c = plan.captions[0]
+        return FixPatch(
+            op=FixOp.add_visual,
+            file=screenshots[0],
+            from_word=c.from_word,
+            to_word=c.to_word,
+        )
     if "recaption" in text and plan.captions:
         c = plan.captions[0]
         tail = text.split("recaption", 1)[1].lstrip(" :-")
@@ -125,17 +143,19 @@ def parse_fix(
     transcript: Transcript,
     cfg: Config,
     mock: bool = False,
+    screenshots: list[str] | None = None,
 ) -> FixPatch:
     """Map free text to a FixPatch. Raises FixError only when the model fails."""
+    shots = screenshots or []
     if mock:
-        return _mock_patch(instruction, plan)
+        return _mock_patch(instruction, plan, shots)
     key = missing_key(cfg)
     if key:
         return FixPatch(op=FixOp.unknown, note=f"{key} not set — cannot parse fix")
 
     from vedit.stage.plan import _strip_fences
 
-    prompt = _build_prompt(instruction, plan, transcript)
+    prompt = _build_prompt(instruction, plan, transcript, shots)
     client = make_client(cfg)
     last: Exception | None = None
     for attempt in range(1, cfg.retry.llm_attempts + 1):
@@ -177,6 +197,7 @@ def apply_patch(
     plan: EditPlan,
     transcript: Transcript,
     icons_enabled: bool = True,
+    screenshots: list[str] | None = None,
 ) -> tuple[EditPlan, list[str]]:
     """Deterministically patch the plan. Raises FixError for anything unsafe."""
     notes: list[str] = []
@@ -217,6 +238,35 @@ def apply_patch(
             raise FixError("retime range crosses a cut boundary")
         v.from_word, v.to_word = lo, hi
         notes.append(f"fix: retime_visual {v.id} -> {lo}..{hi}")
+
+    elif patch.op == FixOp.add_visual:
+        shots = screenshots or []
+        if not patch.file:
+            raise FixError("add_visual needs file (which input image)")
+        if patch.file not in shots:
+            have = ", ".join(shots) or "none — send images to the bot first"
+            raise FixError(f"'{patch.file}' is not an input image (have: {have})")
+        lo, hi = patch.from_word, patch.to_word
+        if lo is None or hi is None:
+            raise FixError("add_visual needs from_word and to_word")
+        if not (0 <= lo < hi < n):
+            raise FixError(f"add range {lo}..{hi} out of bounds (n={n})")
+        if not _same_segment(plan, lo, hi):
+            raise FixError("add range crosses a cut boundary")
+        taken = {v.id for v in plan.visuals}
+        num = 1
+        while f"v{num}" in taken:
+            num += 1
+        plan.visuals.append(
+            Visual(
+                id=f"v{num}",
+                kind="screenshot",
+                file=patch.file,
+                from_word=lo,
+                to_word=hi,
+            )
+        )
+        notes.append(f"fix: add_visual v{num} '{patch.file}' -> {lo}..{hi}")
 
     elif patch.op == FixOp.recaption:
         if not patch.text:

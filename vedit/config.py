@@ -27,6 +27,11 @@ class CutsCfg:
     adaptive_multiplier: float
     pre_roll_ms: int
     post_roll_ms: int
+    silence_noise_db: float
+    silence_min_dur_ms: int
+    silence_merge_gap_ms: int
+    silence_pad_ms: int
+    word_drop_min_s: float
 
 
 @dataclass(frozen=True)

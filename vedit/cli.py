@@ -199,9 +199,27 @@ def s_transcribe(ctx: Ctx) -> None:
 
 def s_cut(ctx: Ctx) -> None:
     probe = st.load_json(ctx.state / "probe.json")
-    segments = cuts.compute_segments(
-        _load_transcript(ctx).words, probe["dur"], ctx.cfg.cuts
-    )
+    transcript = _load_transcript(ctx)
+    words = transcript.words
+    if not ctx.mock:
+        # whisper stretches word timings across real pauses: cross-check the
+        # raw track and shrink phantom spans before the gap rules run
+        raw_audio = ctx.work / "audio" / "raw_48k.wav"
+        if raw_audio.exists():
+            silences = ff.detect_silences(
+                raw_audio,
+                ctx.cfg.cuts.silence_noise_db,
+                ctx.cfg.cuts.silence_min_dur_ms / 1000.0,
+                ctx.cfg.cuts.silence_merge_gap_ms / 1000.0,
+            )
+            words, stats = cuts.correct_words(words, silences, ctx.cfg.cuts)
+            transcript = Transcript(words=words)
+            st.save_model(ctx.state / "transcript.json", transcript)
+            _log(
+                f"[cut] silence assist: {len(silences)} pauses, "
+                f"{stats['shrunk']} words shrunk, {stats['dropped']} dropped"
+            )
+    segments = cuts.compute_segments(words, probe["dur"], ctx.cfg.cuts)
     st.save_json(ctx.state / "segments.json", [s.model_dump() for s in segments])
     kept = sum(s.end - s.start for s in segments)
     _log(f"[cut] {len(segments)} segments, {kept:.1f}s kept of {probe['dur']:.1f}s")
@@ -512,13 +530,22 @@ def cmd_fix(args: argparse.Namespace) -> int:
     ctx = _ctx_from_state(state, cfg, plan.prompt, args.chat_id or "")
     transcript = _load_transcript(ctx)
     _log(f"[fix] {args.instruction}")
+    shots = (
+        sorted(p.name for p in ctx.attachments.iterdir() if p.is_file())
+        if ctx.attachments
+        else []
+    )
 
     try:
         patch = fix_stage.parse_fix(
-            args.instruction, plan, transcript, cfg, mock=ctx.mock
+            args.instruction, plan, transcript, cfg, mock=ctx.mock, screenshots=shots
         )
         new_plan, notes = fix_stage.apply_patch(
-            patch, plan, transcript, icons_enabled=ctx.cfg.visuals.icons_enabled
+            patch,
+            plan,
+            transcript,
+            icons_enabled=ctx.cfg.visuals.icons_enabled,
+            screenshots=shots,
         )
     except fix_stage.FixError as exc:
         _log(f"[fix] {exc}")

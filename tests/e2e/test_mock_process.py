@@ -168,3 +168,47 @@ def test_screenshots_only_places_input_image(tmp_path):
     assert resolved[0]["asset"].endswith("diagram.png")
     assert (state / "attachments" / "diagram.png").exists()
     assert json.loads((state / "qc.json").read_text(encoding="utf-8"))["passed"] is True
+
+
+def test_fix_can_place_input_image(tmp_path):
+    from PIL import Image
+
+    shots = tmp_path / "shots2"
+    shots.mkdir()
+    Image.new("RGB", (320, 200), (30, 120, 200)).save(shots / "diagram.png")
+
+    assert (
+        main(
+            [
+                "process",
+                "--mock",
+                "--name",
+                "shotsfix",
+                "--out",
+                str(tmp_path),
+                "--attachments",
+                str(shots),
+                *CFG,
+            ]
+        )
+        == 0
+    )
+    state = tmp_path / "shotsfix"
+    before = json.loads((state / "edit_plan.json").read_text(encoding="utf-8"))
+    rc = main(
+        [
+            "fix",
+            "--state",
+            str(state),
+            "--instruction",
+            "place the diagram at the start",
+            *CFG,
+        ]
+    )
+    assert rc == 0
+    after = json.loads((state / "edit_plan.json").read_text(encoding="utf-8"))
+    assert len(after["visuals"]) == len(before["visuals"]) + 1
+    assert after["visuals"][-1]["file"] == "diagram.png"
+    resolved = json.loads((state / "resolved.json").read_text(encoding="utf-8"))
+    assert len(resolved) == len(after["visuals"])
+    assert json.loads((state / "qc.json").read_text(encoding="utf-8"))["passed"] is True

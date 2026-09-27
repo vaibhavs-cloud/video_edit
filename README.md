@@ -112,8 +112,8 @@ Prereqs: `ffmpeg` (with `ass` filter), Python 3.12, Node 24, `git`, `gh`.
      (fallback), optionally with free-text instructions.
    - Receive `final.mp4` + report caption ending in `state <sha8>`.
    - **Reply** to that message with a correction:
-     `remove the visual …` · `recaption 0:45: …` ·
-     `move the visual at 0:20 to 0:30`
+     `place diagram.png at 0:20` · `remove the visual …` ·
+     `recaption 0:45: …` · `move the visual at 0:20 to 0:30`
    - Unsupported instructions get a hint message — nothing re-renders.
 
    No Iconify icons are ever overlaid (`visuals.icons_enabled: false`):

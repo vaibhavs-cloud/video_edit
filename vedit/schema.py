@@ -211,6 +211,7 @@ class FixOp(str, Enum):
     remove_visual = "remove_visual"
     recaption = "recaption"
     retime_visual = "retime_visual"
+    add_visual = "add_visual"
     unknown = "unknown"
 
 
@@ -221,6 +222,7 @@ class FixPatch(BaseModel):
     from_word: int | None = None
     to_word: int | None = None
     text: str | None = None
+    file: str | None = None
     note: str | None = None
 
 

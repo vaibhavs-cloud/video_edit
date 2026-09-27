@@ -96,6 +96,88 @@ def test_parse_fix_mock_heuristics(edit_plan, transcript, cfg):
     assert p.op == FixOp.unknown
 
 
+def test_add_visual_places_input_image(edit_plan, transcript):
+    cap = edit_plan.captions[0]
+    before = len(edit_plan.visuals)
+    out, notes = apply_patch(
+        FixPatch(
+            op=FixOp.add_visual,
+            file="diagram.png",
+            from_word=cap.from_word,
+            to_word=cap.to_word,
+        ),
+        edit_plan,
+        transcript,
+        screenshots=["diagram.png"],
+    )
+    assert len(out.visuals) == before + 1
+    added = out.visuals[-1]
+    assert added.kind == "screenshot" and added.file == "diagram.png"
+    assert (added.from_word, added.to_word) == (cap.from_word, cap.to_word)
+    assert any("add_visual" in n for n in notes)
+
+
+def test_add_visual_unknown_file_rejected(edit_plan, transcript):
+    cap = edit_plan.captions[0]
+    with pytest.raises(FixError, match="not an input image"):
+        apply_patch(
+            FixPatch(
+                op=FixOp.add_visual,
+                file="nope.png",
+                from_word=cap.from_word,
+                to_word=cap.to_word,
+            ),
+            edit_plan,
+            transcript,
+            screenshots=["diagram.png"],
+        )
+
+
+def test_add_visual_without_images_rejected(edit_plan, transcript):
+    cap = edit_plan.captions[0]
+    with pytest.raises(FixError, match="send images"):
+        apply_patch(
+            FixPatch(
+                op=FixOp.add_visual,
+                file="diagram.png",
+                from_word=cap.from_word,
+                to_word=cap.to_word,
+            ),
+            edit_plan,
+            transcript,
+            screenshots=[],
+        )
+
+
+def test_add_visual_crossing_cut_rejected(edit_plan, transcript, segments):
+    if len(segments) < 2:
+        pytest.skip("fixture has a single segment")
+    with pytest.raises(FixError, match="cut boundary"):
+        apply_patch(
+            FixPatch(
+                op=FixOp.add_visual,
+                file="diagram.png",
+                from_word=segments[0].keep_to_word - 1,
+                to_word=segments[1].keep_from_word + 1,
+            ),
+            edit_plan,
+            transcript,
+            screenshots=["diagram.png"],
+        )
+
+
+def test_parse_fix_mock_place_heuristic(edit_plan, transcript, cfg):
+    p = parse_fix(
+        "place the diagram at the start",
+        edit_plan,
+        transcript,
+        cfg,
+        mock=True,
+        screenshots=["diagram.png"],
+    )
+    assert p.op == FixOp.add_visual and p.file == "diagram.png"
+
+
 def test_override_text_renders_single_line(edit_plan, cfg):
     edit_plan.captions[0].override_text = "custom line here"
     lines = build_lines(edit_plan, cfg)

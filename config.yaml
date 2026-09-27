@@ -8,11 +8,18 @@ cuts:
   cut_gap_ms: 600
   keep_gap_ms: 350
   pad_ms: 120
-  min_kept_segment_ms: 700
+  min_kept_segment_ms: 500
   min_output_s: 40
   adaptive_multiplier: 1.8
   pre_roll_ms: 80
   post_roll_ms: 140
+  # silence assist (VAD cross-check on the RAW track — whisper stretches
+  # word timings across real pauses, hiding them from the gap rules)
+  silence_noise_db: -25
+  silence_min_dur_ms: 400
+  silence_merge_gap_ms: 250
+  silence_pad_ms: 80
+  word_drop_min_s: 0.5
 
 audio:
   highpass_hz: 80

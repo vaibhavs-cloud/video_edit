@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import pytest
 
+from vedit import ff
 from vedit.schema import Word
-from vedit.stage.cuts import CutsError, compute_segments
+from vedit.stage.cuts import CutsError, compute_segments, correct_words
 
 
 def _words(spans: list[tuple[float, list[tuple[float, float]]]]) -> list[Word]:
@@ -77,3 +78,61 @@ def test_contiguous_word_indices_required_by_schema(cfg):
     segs = compute_segments(words, 5.0, cfg.cuts)
     assert segs[0].keep_from_word == 0
     assert segs[0].keep_to_word == len(words) - 1
+
+
+def _w(i: int, s: float, e: float, t: str = "w") -> Word:
+    return Word(i=i, t=t, s=s, e=e)
+
+
+def test_correct_words_shrinks_stretched_span(cfg):
+    words = [_w(0, 10.0, 10.4, "a"), _w(1, 10.4, 13.0, "b"), _w(2, 13.0, 13.4, "c")]
+    fixed, stats = correct_words(words, [(11.0, 12.6)], cfg.cuts)
+    assert stats == {"shrunk": 1, "dropped": 0}
+    assert (fixed[1].s, fixed[1].e) == (10.4, 10.92)
+    assert [w.i for w in fixed] == [0, 1, 2]
+
+
+def test_correct_words_drops_zero_energy_word(cfg):
+    words = [_w(0, 19.0, 19.4, "a"), _w(1, 19.5, 20.6, "x"), _w(2, 20.7, 21.0, "b")]
+    fixed, stats = correct_words(words, [(19.2, 20.7)], cfg.cuts)
+    assert stats["dropped"] == 1
+    assert [w.t for w in fixed] == ["a", "b"]
+    assert [w.i for w in fixed] == [0, 1]
+
+
+def test_correct_words_keeps_sliver_of_speech(cfg):
+    words = [_w(0, 30.0, 30.2, "a"), _w(1, 30.2, 31.6, "y")]
+    fixed, stats = correct_words(words, [(30.0, 31.0)], cfg.cuts)
+    assert stats == {"shrunk": 1, "dropped": 0}
+    assert fixed[1].s == pytest.approx(31.08)
+    assert fixed[1].e == 31.6
+
+
+def test_correct_words_keeps_short_jitter_word(cfg):
+    words = [_w(0, 40.0, 40.3, "z")]
+    fixed, stats = correct_words(words, [(39.0, 41.0)], cfg.cuts)
+    assert stats == {"shrunk": 0, "dropped": 0}
+    assert (fixed[0].s, fixed[0].e) == (40.0, 40.3)
+
+
+def test_correct_words_without_silences_is_identity(cfg):
+    words = _words([_burst(1.0)])
+    fixed, stats = correct_words(words, [], cfg.cuts)
+    assert stats == {"shrunk": 0, "dropped": 0}
+    assert [w.i for w in fixed] == [w.i for w in words]
+    for f, w in zip(fixed, words):
+        assert f.s == pytest.approx(w.s) and f.e == pytest.approx(w.e)
+
+
+def test_detect_silences_parses_and_merges(monkeypatch, tmp_path):
+    out = (
+        "[Parsed_silencedetect_0 @ x] silence_start: 1.0\n"
+        "[Parsed_silencedetect_0 @ x] silence_end: 1.5 | silence_duration: 0.5\n"
+        "[Parsed_silencedetect_0 @ x] silence_start: 1.6\n"
+        "[Parsed_silencedetect_0 @ x] silence_end: 2.2 | silence_duration: 0.6\n"
+        "[Parsed_silencedetect_0 @ x] silence_start: 5.0\n"
+        "[Parsed_silencedetect_0 @ x] silence_end: 5.8 | silence_duration: 0.8\n"
+    )
+    monkeypatch.setattr(ff, "run", lambda *a, **k: out)
+    got = ff.detect_silences(tmp_path / "x.wav", -25.0, 0.4, 0.25)
+    assert got == [(1.0, 2.2), (5.0, 5.8)]

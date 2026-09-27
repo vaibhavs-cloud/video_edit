@@ -87,7 +87,7 @@ GitHub Actions  — burst compute, free tier (unlimited minutes on a public repo
 Final files delivered back via Telegram
 ```
 
-**Silence detection is deterministic**, not model judgement: word-level transcript timestamps drive gap rules (600/350 ms + 120 ms pad, adaptive median) in code. The LLM never emits cut times.
+**Silence detection is deterministic**, not model judgement: word-level transcript timestamps drive gap rules (600/350 ms + 120 ms pad, adaptive median) in code, cross-checked against energy-based silence intervals on the raw track (whisper stretches word timings across real pauses). The LLM never emits cut times.
 
 **Why this shape:** nothing is "always running" except a near-zero-cost edge function (the Worker). Compute only exists for the few minutes it takes to process a video. This satisfies "free and active 24/7 whenever needed" without paying for, or needing a card for, persistent hosting.
 
@@ -113,7 +113,7 @@ edit_plan.json → segments: [{start, end, cuts, visual_query}, ...]
 - **Cross-run state** travels as a small artifact (`edit_plan.json`, transcript, markers — never media); media is re-derived from the source on every run. Partial *decision* reuse is what matters: a fix never re-runs transcription or planning.
 - Correction-loop note: segments are re-rendered in full on a fix (deterministic, unchanged segments come out identical); byte-for-byte segment reuse across runs is a documented future optimization, not an MVP dependency.
 
-**This is what makes targeted correction possible.** A correction like "the icon at 0:20 is wrong" or "fix the caption at 0:45" maps to one segment or one caption-range in `edit_plan.json` via a structured patch op (`replace_icon | remove_visual | recaption | retime_visual`); only that piece of the *plan* changes, transcription and planning are untouched, and the video is re-rendered deterministically from the patched plan.
+**This is what makes targeted correction possible.** A correction like "place diagram.png at 0:20" or "fix the caption at 0:45" maps to one segment or one caption-range in `edit_plan.json` via a structured patch op (`add_visual | remove_visual | recaption | retime_visual`, plus legacy `replace_icon` when icons are enabled); only that piece of the *plan* changes, transcription and planning are untouched, and the video is re-rendered deterministically from the patched plan. Silence cutting is automatic and can't be re-cut by a fix — surviving pauses get the cut settings tuned instead.
 
 ---
 
@@ -174,9 +174,9 @@ No JSON mapping table of concept → asset file is maintained by hand. If the mo
 ## 9. Review/correction workflow
 
 1. Owner receives `final_video.mp4` + `edit_report.md` via Telegram.
-2. Owner either approves (publish) or replies with a targeted note, e.g. "fix the icon at 0:20" or "recaption 0:45–0:50."
+2. Owner either approves (publish) or replies with a targeted note, e.g. "place diagram.png where I say unit test" or "recaption 0:45–0:50."
 3. The correction is mapped to a structured patch op over `edit_plan.json`
-   (`replace_icon | remove_visual | recaption | retime_visual`); anything else
+   (`add_visual | remove_visual | recaption | retime_visual`); anything else
    is answered with supported phrasings and no render.
 4. The plan is patched and re-validated; transcription and planning are never
    re-run. The video is re-rendered deterministically from the patched plan.

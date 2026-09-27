@@ -178,6 +178,31 @@ def test_parse_fix_mock_place_heuristic(edit_plan, transcript, cfg):
     assert p.op == FixOp.add_visual and p.file == "diagram.png"
 
 
+def test_add_visual_defaults_file_and_range(edit_plan, transcript):
+    out, notes = apply_patch(
+        FixPatch(op=FixOp.add_visual),
+        edit_plan,
+        transcript,
+        screenshots=["image-1.jpg"],
+    )
+    added = out.visuals[-1]
+    seg0 = edit_plan.segments[0]
+    assert added.file == "image-1.jpg"
+    assert added.from_word == seg0.keep_from_word
+    assert added.to_word == min(seg0.keep_from_word + 4, seg0.keep_to_word)
+    assert any("defaulted" in n for n in notes)
+
+
+def test_add_visual_no_images_no_file_rejected(edit_plan, transcript):
+    with pytest.raises(FixError, match="send images"):
+        apply_patch(
+            FixPatch(op=FixOp.add_visual),
+            edit_plan,
+            transcript,
+            screenshots=[],
+        )
+
+
 def test_override_text_renders_single_line(edit_plan, cfg):
     edit_plan.captions[0].override_text = "custom line here"
     lines = build_lines(edit_plan, cfg)

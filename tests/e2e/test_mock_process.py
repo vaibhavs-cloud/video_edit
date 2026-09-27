@@ -212,3 +212,20 @@ def test_fix_can_place_input_image(tmp_path):
     resolved = json.loads((state / "resolved.json").read_text(encoding="utf-8"))
     assert len(resolved) == len(after["visuals"])
     assert json.loads((state / "qc.json").read_text(encoding="utf-8"))["passed"] is True
+
+    # vague follow-up ("add it") reuses the staged image near the start
+    rc = main(
+        [
+            "fix",
+            "--state",
+            str(state),
+            "--instruction",
+            "add it to this video",
+            *CFG,
+        ]
+    )
+    assert rc == 0
+    vague = json.loads((state / "edit_plan.json").read_text(encoding="utf-8"))
+    assert len(vague["visuals"]) == len(after["visuals"]) + 1
+    assert vague["visuals"][-1]["file"] == "diagram.png"
+    assert json.loads((state / "qc.json").read_text(encoding="utf-8"))["passed"] is True

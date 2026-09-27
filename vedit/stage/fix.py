@@ -21,11 +21,11 @@ class FixError(RuntimeError):
 
 
 SUPPORTED = (
-    'supported fixes: place an input image ("place diagram.png at 0:20") · '
-    'remove the visual · recaption a span ("recaption 0:45: ...") · '
-    'retime a visual ("move the visual at 0:20 to 0:30"). '
-    "Silence cutting is automatic — a fix can't re-cut; report surviving "
-    "pauses and the cut settings get tuned instead."
+    'supported fixes: place an input image ("place image 1 at 0:20", or just '
+    '"add it to this video") · remove the visual · recaption a span '
+    '("recaption 0:45: ...") · retime a visual ("move the visual at 0:20 to '
+    "0:30\"). Silence cutting is automatic — a fix can't re-cut; report "
+    "surviving pauses and the cut settings get tuned instead."
 )
 
 
@@ -82,7 +82,7 @@ OPS (pick exactly one):
 - remove_visual: drop a visual; set visual_id
 - recaption: replace caption text; set from_word (start of the target caption) + text
 - retime_visual: move a visual in time; set visual_id + from_word + to_word (source word indices)
-- add_visual: place an input image; set file (exactly one of AVAILABLE SCREENSHOTS) + from_word + to_word (source word indices, inside one segment)
+- add_visual: place an input image; set file (exactly one of AVAILABLE SCREENSHOTS) + from_word + to_word (source word indices, inside one segment). If the instruction says to add the image without naming one, omit file and the first available screenshot is used. If it names no time or words, omit from_word/to_word and the image goes near the start (it can be retimed after).
 - unknown: the instruction is not about visuals or captions at all
 
 TARGETING: when the instruction names a time or describes a position, pick the
@@ -241,14 +241,27 @@ def apply_patch(
 
     elif patch.op == FixOp.add_visual:
         shots = screenshots or []
-        if not patch.file:
-            raise FixError("add_visual needs file (which input image)")
-        if patch.file not in shots:
+        target_file = patch.file
+        if not target_file:
+            if not shots:
+                raise FixError("nothing to place — send images to the bot first")
+            target_file = shots[0]
+        elif target_file not in shots:
             have = ", ".join(shots) or "none — send images to the bot first"
-            raise FixError(f"'{patch.file}' is not an input image (have: {have})")
+            raise FixError(f"'{target_file}' is not an input image (have: {have})")
         lo, hi = patch.from_word, patch.to_word
         if lo is None or hi is None:
-            raise FixError("add_visual needs from_word and to_word")
+            if not plan.segments:
+                raise FixError("this plan has no segments to place an image in")
+            seg0 = plan.segments[0]
+            lo = seg0.keep_from_word
+            hi = min(lo + 4, seg0.keep_to_word)
+            if hi <= lo:
+                raise FixError(
+                    "the start is too short to place an image — "
+                    "name a time instead (e.g. 'at 0:20')"
+                )
+            notes.append(f"fix: add_visual target defaulted to {lo}..{hi}")
         if not (0 <= lo < hi < n):
             raise FixError(f"add range {lo}..{hi} out of bounds (n={n})")
         if not _same_segment(plan, lo, hi):
@@ -261,12 +274,12 @@ def apply_patch(
             Visual(
                 id=f"v{num}",
                 kind="screenshot",
-                file=patch.file,
+                file=target_file,
                 from_word=lo,
                 to_word=hi,
             )
         )
-        notes.append(f"fix: add_visual v{num} '{patch.file}' -> {lo}..{hi}")
+        notes.append(f"fix: add_visual v{num} '{target_file}' -> {lo}..{hi}")
 
     elif patch.op == FixOp.recaption:
         if not patch.text:

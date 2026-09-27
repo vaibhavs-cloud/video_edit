@@ -78,7 +78,7 @@ async function handleUpdate(update, env) {
         await sendText(
           env,
           chatId,
-          'send the correction as a reply, e.g. "use a shield icon at 0:20"',
+          'send the correction as a reply, e.g. "place image 1 at 0:20"',
         );
         return;
       }
@@ -87,6 +87,7 @@ async function handleUpdate(update, env) {
         chat_id: chatId,
         state_ref: stateRef[0],
         instruction: text,
+        attachments: JSON.stringify(await takePending(env, chatId)),
       });
       await sendText(env, chatId, `queued fix ${stateRef[0]} — new cut coming`);
       return;

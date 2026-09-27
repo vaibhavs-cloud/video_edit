@@ -470,9 +470,17 @@ def cmd_attach(args: argparse.Namespace) -> int:
     from vedit.telegram_client import Telegram
 
     tg = Telegram()
-    for i, fid in enumerate(file_ids):
+    # Numbered names match the bot's "saved image N" confirmations, so the
+    # owner can say "place image 1 at 0:20". Continue past existing ones.
+    start = 0
+    for p in (state / "attachments").iterdir():
+        num = p.name.removeprefix("image-").split(".")[0]
+        if num.isdigit():
+            start = max(start, int(num))
+    for k, fid in enumerate(file_ids, start=start + 1):
         info = tg.resolve(fid)
-        name = Path(str(info.get("file_path") or f"file_{i}")).name or f"file_{i}.bin"
+        ext = Path(str(info.get("file_path") or "")).suffix or ".jpg"
+        name = f"image-{k}{ext}"
         dest = state / "attachments" / name
         tg.download(fid, dest, cfg.limits.telegram_download_max_bytes)
         _log(f"[attach] {name} ({dest.stat().st_size} bytes)")

@@ -45,6 +45,8 @@ video:
 
 visuals:
   icons_enabled: false # no Iconify overlays; only input images (screenshots) are placed
+  screenshot_mode: cover # cover = image fills the 1080x1920 frame (center-cropped)
+  transitions: ["fade", "rise", "drift"] # cycled per visual; subtle only
   prefixes: lucide,ph
   search_limit: 32
   shortlist: 8

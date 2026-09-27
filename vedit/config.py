@@ -63,6 +63,8 @@ class VideoCfg:
 @dataclass(frozen=True)
 class VisualsCfg:
     icons_enabled: bool
+    screenshot_mode: str  # cover = full-frame crop; overlay = floating box
+    transitions: list[str]  # cycled per visual; subtle only (fade/rise/drift)
     prefixes: str
     search_limit: int
     shortlist: int

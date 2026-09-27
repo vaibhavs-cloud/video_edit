@@ -34,6 +34,8 @@ class OverlayPlan:
     local_end: float
     fade_in: float
     fade_out: float
+    fx: str = "fade"  # fade | rise | drift (screenshots in cover mode only)
+    fx_dur: float = 0.0  # local duration the motion runs over (drift)
 
 
 def ensure_base(source: Path, plan: EditPlan, workdir: Path, cfg: Config) -> Path:
@@ -108,7 +110,8 @@ def _overlays_for_segment(
 ) -> list[OverlayPlan]:
     out: list[OverlayPlan] = []
     fade = cfg.visuals.fade_s
-    for rv in resolved:
+    fx_list = cfg.visuals.transitions or ["fade"]
+    for idx, rv in enumerate(resolved):
         v = rv.visual
         vis_start = plan.words[v.from_word].s
         vis_end = plan.words[v.to_word].e
@@ -118,18 +121,26 @@ def _overlays_for_segment(
             continue
 
         is_shot = v.kind == "screenshot"
-        iw, ih = _image_size(rv.asset)
-        if is_shot:
+        cover = is_shot and cfg.visuals.screenshot_mode == "cover"
+        if cover:
+            aw, ah = cfg.video.width, cfg.video.height
+            x, y = 0, 0
+        elif is_shot:
+            iw, ih = _image_size(rv.asset)
             target_w = int(cfg.video.width * cfg.visuals.screenshot_width_frac)
             target_w -= target_w % 2
             target_h = max(2, int(ih * (target_w / iw)))
             aw, ah = target_w + 12, target_h + 12  # + border pad
         else:
+            iw, ih = _image_size(rv.asset)
             aw, ah = iw, ih
 
-        x, y = _place(v.pos, aw, ah, cfg)
-        if x < 0 or y < 0 or x + aw > cfg.video.width or y + ah > cfg.video.height:
-            raise RenderError(f"overlay {v.id} does not fit the frame at pos={v.pos}")
+        if not cover:
+            x, y = _place(v.pos, aw, ah, cfg)
+            if x < 0 or y < 0 or x + aw > cfg.video.width or y + ah > cfg.video.height:
+                raise RenderError(
+                    f"overlay {v.id} does not fit the frame at pos={v.pos}"
+                )
 
         local_start = max(vis_start, seg_start) - seg_start
         local_end = min(vis_end, seg_end) - seg_start
@@ -139,18 +150,25 @@ def _overlays_for_segment(
         in_dur = local_end - local_start
         fin = 0.0 if vis_start < seg_start + 1e-3 else min(fade, in_dur * 0.4)
         fout = 0.0 if vis_end > seg_end - 1e-3 else min(fade, in_dur * 0.4)
+        fx = fx_list[idx % len(fx_list)] if cover else "fade"
 
+        if cover:
+            w, h = cfg.video.width, cfg.video.height
+        else:
+            w, h = aw - (12 if is_shot else 0), ah - (12 if is_shot else 0)
         out.append(
             OverlayPlan(
                 path=rv.asset,
                 x=x,
                 y=y,
-                w=aw - (12 if is_shot else 0),
-                h=ah - (12 if is_shot else 0),
+                w=w,
+                h=h,
                 local_start=local_start,
                 local_end=local_end,
                 fade_in=fin,
                 fade_out=fout,
+                fx=fx,
+                fx_dur=in_dur,
             )
         )
     return out
@@ -175,8 +193,26 @@ def _filter_for_segment(
 
     current = "[vbase]"
     parts = list(chain)
+    W, H = cfg.video.width, cfg.video.height
     for k, ov in enumerate(overlays, start=1):
         img_parts = [f"[{k + 1}:v]format=rgba"]
+        if ov.w == W and ov.h == H and ov.fx in ("fade", "rise", "drift"):
+            # full-frame cover: scale up, center-crop (drift pre-scales larger)
+            if ov.fx == "drift":
+                dw, dh = W + (W // 16 // 2 * 2), H + (H // 16 // 2 * 2)
+                img_parts.append(
+                    f"scale={W}:{H}:force_original_aspect_ratio=increase:"
+                    f"flags=lanczos,crop={W}:{H},scale={dw}:{dh}:flags=lanczos"
+                )
+            else:
+                img_parts.append(
+                    f"scale={W}:{H}:force_original_aspect_ratio=increase:"
+                    f"flags=lanczos,crop={W}:{H}"
+                )
+                dw, dh = W, H
+        else:
+            dw, dh = ov.w, ov.h
+            img_parts.append(f"scale={dw}:{dh}:flags=lanczos")
         if ov.fade_in > 0:
             img_parts.append(f"fade=t=in:st=0:d={ov.fade_in:.3f}:alpha=1")
         if ov.fade_out > 0:
@@ -184,9 +220,18 @@ def _filter_for_segment(
                 f"fade=t=out:st={max(0.0, ov.local_end - ov.fade_out):.3f}:d={ov.fade_out:.3f}:alpha=1"
             )
         parts.append(",".join(img_parts) + f"[ov{k}]")
+        s, e, d = ov.local_start, ov.local_end, max(ov.fx_dur, 0.5)
+        if ov.fx == "rise" and dw == W:
+            x_expr, y_expr = "0", f"'max(0,{H}*(1-(t-{s:.3f})/0.35))'"
+        elif ov.fx == "drift" and dw > W:
+            dx, dy = dw - W, dh - H
+            x_expr = f"'-{dx}+{dx}*min(1,(t-{s:.3f})/{d:.3f})'"
+            y_expr = f"'-{dy}+{dy}*min(1,(t-{s:.3f})/{d:.3f})'"
+        else:
+            x_expr, y_expr = str(ov.x), str(ov.y)
         parts.append(
-            f"{current}[ov{k}]overlay=x={ov.x}:y={ov.y}:"
-            f"enable='between(t,{ov.local_start:.3f},{ov.local_end:.3f})'[v{k}]"
+            f"{current}[ov{k}]overlay=x={x_expr}:y={y_expr}:"
+            f"enable='between(t,{s:.3f},{e:.3f})'[v{k}]"
         )
         current = f"[v{k}]"
     parts.append(

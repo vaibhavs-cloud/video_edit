@@ -103,21 +103,22 @@ Prereqs: `ffmpeg` (with `ass` filter), Python 3.12, Node 24, `git`, `gh`.
    curl https://vedit-relay.<subdomain>.workers.dev/health   # → ok
    ```
 
-6. **Use it from Telegram**
+6. **Use it from Telegram** (batch mode — nothing runs until `done`)
 
-   - (Optional) Send **images first** — each is staged for one hour and the
-     bot confirms `saved image N`. They are attached to your next video/link
-     run and the planner places them where they fit what is being said.
-   - Send a **Drive share link** (primary, any size) or a video **≤20 MB**
-     (fallback), optionally with free-text instructions.
+   - Send the **video** (≤20 MB) or a **Drive share link** — the bot holds
+     it and confirms. Optionally add instructions alongside.
+   - Send **images**, each captioned with a label + placement in any
+     timestamp format: `pyramid at 0:20` · `diagram 0:45-0:50` ·
+     `chart @1m20s`. No caption = planner places it where it fits.
+     Images fill the whole frame (center-cropped) with subtle varied
+     transitions (fade / rise / drift); no floating icons, ever.
+   - Send **`done`** — v1 builds once with everything placed.
+     `cancel` clears the staging area.
    - Receive `final.mp4` + report caption ending in `state <sha8>`.
    - **Reply** to that message with a correction:
-     `place diagram.png at 0:20` · `remove the visual …` ·
+     `place image 1 at 0:20` · `remove the visual …` ·
      `recaption 0:45: …` · `move the visual at 0:20 to 0:30`
    - Unsupported instructions get a hint message — nothing re-renders.
-
-   No Iconify icons are ever overlaid (`visuals.icons_enabled: false`):
-   the only on-screen images are the ones you send.
 
 ### CLI (local runs)
 

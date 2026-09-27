@@ -38,6 +38,8 @@ The owner records himself explaining a software/CS concept (APIs, JWT, authentic
 
 **Delivery of the raw video:** the Telegram Bot API caps file *downloads* at 20 MB, so a Google Drive share link (opened with `gdown`) is the **primary** input path; a ≤20 MB Telegram attachment is the fallback. The agent auto-detects the source aspect ratio and reframes deterministically to 9:16 (center crop, `x_frac` override in config).
 
+**Batching:** the bot never runs on first contact. The owner sends the video/link, then any number of images captioned with label + placement (`pyramid at 0:20`, any timestamp formatting), then a `done` confirmation — only then does one run build v1 with everything placed, so revisions stay minimal. `cancel` clears the batch.
+
 The agent must never require a script, manual timestamps, a shot list, or a pre-selected image list. It infers all of that itself.
 
 ### Output
@@ -127,11 +129,11 @@ edit_plan.json → segments: [{start, end, cuts, visual_query}, ...]
 
 Concept keywords come from the plan model's structured output (§4). For each keyword:
 
-1. Search Iconify with pinned prefixes (`lucide,ph`) and keep a shortlist of up to 8 candidates (`https://api.iconify.design/search?query=<keyword>&prefixes=lucide,ph` — free, no auth, 200,000+ icons across 200+ open icon sets).
-2. One batched LLM call picks the single best icon per concept from its shortlist — **or `null`** when nothing fits (best-of-8-or-none; never a forced bad pick).
-3. Fetch the chosen SVG, render it to PNG (`rsvg-convert` primary), and overlay it as a simple fade-in/fade-out element near the frame edge — not a full animated diagram. This matches the "raw" style goal and keeps the render step cheap and simple.
+1. Search Iconify with pinned prefixes (`lucide,ph`) and keep a shortlist of up to 8 candidates (`https://api.iconify.design/search?query=<keyword>&prefixes=lucide,ph` — free, no auth, 200,000+ icons across 200+ open icon sets). (Dormant while `icons_enabled: false`.)
+2. One batched LLM call picks the single best icon per concept from its shortlist — **or `null`** when nothing fits (best-of-8-or-none; never a forced bad pick). (Dormant while `icons_enabled: false`.)
+3. Input images (`screenshot` kind) fill the whole 1080×1920 frame (center-cropped cover, never floating boxes) and cycle subtle transitions — fade, gentle rise, slow drift — one per visual in config order.
 4. Deterministic caps apply after the pick: ≤1 visual per 8 s density window and a max-visuals limit, so a confident-but-wrong model answer still cannot overcrowd the video.
-5. User-attached screenshots may also be placed directly (kind `screenshot`) when the plan references a listed filename.
+5. User-attached screenshots are placed directly (kind `screenshot`) when the plan references a listed filename — batched via the bot (`done` flow) with captioned placements, or added later via the `add_visual` correction op.
 
 No JSON mapping table of concept → asset file is maintained by hand. If the model surfaces a brand-new concept it's never seen before, the search still works — vocabulary is unbounded by construction.
 

@@ -80,6 +80,7 @@ DECIDE
 {visual_rules}
     - range [from_word, to_word] inclusive, must lie inside ONE kept segment
     - pos: where it sits; zoom: true only for a strong emphasis moment
+    - Owner-specified placements in the instruction (image name + time) win over everything: use exactly that file, mapped to the closest kept words at that time (times are source seconds; never straddle a cut gap — pick the nearest kept segment)
 2. captions — split the talk into readable spans of 1-6 words each.
    - every word of the transcript should be covered by exactly one span
    - each span must lie inside ONE kept segment (never cross a segment boundary)

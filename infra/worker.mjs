@@ -1,13 +1,20 @@
-// Telegram -> GitHub Actions relay.
+// Telegram -> GitHub Actions relay (batch mode: nothing runs until `done`).
 //
 // POST /tg/<TELEGRAM_SECRET_PATH>  (+ X-Telegram-Bot-Api-Secret-Token check)
 //   reply to a delivered video with text  -> dispatch kind=fix (state_ref + instruction)
-//   text containing a URL                 -> dispatch kind=new (url)
-//   photo / image file                   -> staged in KV, attached to the next run
-//   video attachment <= 20 MB             -> dispatch kind=new (video_file_id)
+//   `done` (or go/process)                -> dispatch staged video/link + images
+//   `cancel`                              -> clear staging, dispatch nothing
+//   text containing a URL                 -> stage the link, wait for `done`
+//   photo / image file                   -> stage it (caption = label + time), wait
+//   video attachment <= 20 MB             -> stage it, wait for `done`
 //   video attachment > 20 MB              -> reply asking for a Drive link
 //   anything else                         -> usage help
 // GET /health -> 200
+//
+// Staging lives in KV (1h TTL): pending_video:<chat> + pending:<chat>.
+// Image captions carry label + placement, e.g. `pyramid at 0:20`,
+// `diagram 0:45-0:50`, `chart @1m20s` — any timestamp formatting works,
+// the planner maps times to words and falls back to best-fit.
 //
 // Secrets (Cloudflare secret_text): TELEGRAM_BOT_TOKEN, TELEGRAM_SECRET_PATH,
 // TELEGRAM_SECRET_TOKEN, GH_TOKEN, ALLOWED_CHAT_ID.
@@ -15,6 +22,8 @@
 
 const GITHUB_API = "https://api.github.com";
 const TG_MAX_VIDEO_BYTES = 20 * 1024 * 1024;
+const DONE_WORDS = new Set(["done", "go", "process", "process it", "start", "confirm"]);
+const CANCEL_WORDS = new Set(["cancel", "clear", "reset"]);
 
 export default {
   async fetch(request, env) {
@@ -102,22 +111,67 @@ async function handleUpdate(update, env) {
     }
   }
 
-  // 2) URL in text -> Drive/direct link run
+  // 2) staging commands (plain text only — never a reply/caption/media)
+  const hasMedia = Boolean(msg.video || msg.photo || msg.document);
+  const cmd = text.toLowerCase();
+  if (!reply && !hasMedia) {
+    if (DONE_WORDS.has(cmd)) {
+      const video = await getVideo(env, chatId);
+      if (!video) {
+        const staged = await getPending(env, chatId);
+        await sendText(
+          env,
+          chatId,
+          staged.length
+            ? `no video staged yet — ${staged.length} image(s) waiting. Send the video or link first (or reply to a delivered video to add them to it).`
+            : "nothing staged yet — send a video or link first, then images, then `done`.",
+        );
+        return;
+      }
+      const imgs = await takePending(env, chatId);
+      await clearVideo(env, chatId);
+      const inputs = {
+        kind: "new",
+        chat_id: chatId,
+        prompt: buildPrompt(video.prompt, imgs),
+        attachments: JSON.stringify(imgs.map((im) => im.id)),
+      };
+      if (video.kind === "url") inputs.url = video.ref;
+      else inputs.video_file_id = video.ref;
+      await dispatch(env, inputs);
+      await sendText(
+        env,
+        chatId,
+        imgs.length
+          ? `queued — building v1 from your video + ${imgs.length} image(s)`
+          : "queued — processing your video now",
+      );
+      return;
+    }
+    if (CANCEL_WORDS.has(cmd)) {
+      await takePending(env, chatId);
+      await clearVideo(env, chatId);
+      await sendText(env, chatId, "cleared — staging empty. Send a video when ready.");
+      return;
+    }
+  }
+
+  // 3) URL in text -> stage the link, wait for `done`
   const urlMatch = text.match(/https?:\/\/\S+/);
-  if (urlMatch) {
+  if (urlMatch && !msg.video) {
     const prompt = text.replace(urlMatch[0], "").trim();
-    await dispatch(env, {
-      kind: "new",
-      chat_id: chatId,
-      url: urlMatch[0],
-      prompt,
-      attachments: JSON.stringify(await takePending(env, chatId)),
-    });
-    await sendText(env, chatId, "queued — processing your link now");
+    await setVideo(env, chatId, { kind: "url", ref: urlMatch[0], prompt });
+    const staged = await getPending(env, chatId);
+    await sendText(
+      env,
+      chatId,
+      `link received — ${staged.length} image(s) already staged. ` +
+        "Send images with captions (`name at 0:20`), then `done` and I'll build v1. Nothing runs until then.",
+    );
     return;
   }
 
-  // 2b) photo / image file -> stage it for the next video/link run
+  // 4) photo / image file -> stage it (caption = label + time)
   const photoSizes = Array.isArray(msg.photo) ? msg.photo : [];
   const photo = photoSizes.length ? photoSizes[photoSizes.length - 1] : null;
   const imageDoc =
@@ -126,18 +180,34 @@ async function handleUpdate(update, env) {
       : null;
   const image = photo || imageDoc;
   if (image && !msg.video) {
-    const count = await pushPending(env, chatId, image.file_id);
+    const note = (msg.caption || "").trim();
+    const count = await pushPending(env, chatId, image.file_id, note);
+    const stagedVideo = await getVideo(env, chatId);
+    const capUrl = note.match(/https?:\/\/\S+/);
+    if (capUrl && !stagedVideo) {
+      await setVideo(env, chatId, {
+        kind: "url",
+        ref: capUrl[0],
+        prompt: note.replace(capUrl[0], "").trim(),
+      });
+    }
+    const p = parsePlacement(note, `image ${count}`);
+    const echo =
+      p.start == null
+        ? ""
+        : ` (${p.label} · ${p.end == null ? "from " + fmtTime(p.start) : fmtTime(p.start) + "–" + fmtTime(p.end)})`;
     await sendText(
       env,
       chatId,
-      `saved image ${count} — now send the video (or a link) and I'll place ${
-        count === 1 ? "it" : "them"
-      } in the edit`,
+      `saved image ${count}${echo} — ` +
+        (stagedVideo || capUrl
+          ? "send more, then `done` and I'll build v1."
+          : "now send the video (or link), then `done`."),
     );
     return;
   }
 
-  // 3) video attachment -> file_id run (<= 20 MB)
+  // 5) video attachment -> stage it (<= 20 MB), wait for `done`
   const media =
     msg.video ||
     (msg.document && /^video\//.test(msg.document.mime_type || "") ? msg.document : null);
@@ -151,29 +221,40 @@ async function handleUpdate(update, env) {
       );
       return;
     }
-    await dispatch(env, {
-      kind: "new",
-      chat_id: chatId,
-      video_file_id: media.file_id,
+    await setVideo(env, chatId, {
+      kind: "video",
+      ref: media.file_id,
       prompt: text,
-      attachments: JSON.stringify(await takePending(env, chatId)),
     });
-    await sendText(env, chatId, "queued — processing your video now");
+    const staged = await getPending(env, chatId);
+    await sendText(
+      env,
+      chatId,
+      `video received — ${staged.length} image(s) already staged. ` +
+        "Send images with captions (`name at 0:20`), then `done` and I'll build v1. Nothing runs until then.",
+    );
     return;
   }
 
-  // 4) anything else -> usage
+  // 6) anything else -> usage
   await sendText(
     env,
     chatId,
-    "send images first (they'll be placed in the edit), then a Google Drive/direct video link, a video (≤20MB), or reply to a delivered video with a correction.",
+    "send a video or link (it waits here), then images with captions " +
+      "(`pyramid at 0:20`), then `done` — v1 builds once, with everything placed. " +
+      "Reply to a delivered video to correct it; `cancel` clears staging.",
   );
 }
 
 // Staged input images, buffered in KV between messages (1h TTL).
-// Missing binding -> behave as if no images were staged.
+// Entries are {id, note}; plain-string entries from older versions are
+// normalized on read. Missing binding -> behave as if nothing was staged.
 function pendingKey(chatId) {
   return `pending:${chatId}`;
+}
+
+function videoKey(chatId) {
+  return `pending_video:${chatId}`;
 }
 
 async function getPending(env, chatId) {
@@ -181,15 +262,18 @@ async function getPending(env, chatId) {
     if (!env.PENDING_IMAGES) return [];
     const raw = await env.PENDING_IMAGES.get(pendingKey(chatId));
     const list = JSON.parse(raw || "[]");
-    return Array.isArray(list) ? list.filter((v) => typeof v === "string") : [];
+    if (!Array.isArray(list)) return [];
+    return list
+      .map((v) => (typeof v === "string" ? { id: v, note: "" } : v))
+      .filter((v) => v && typeof v.id === "string");
   } catch {
     return [];
   }
 }
 
-async function pushPending(env, chatId, fileId) {
+async function pushPending(env, chatId, fileId, note) {
   const list = await getPending(env, chatId);
-  list.push(fileId);
+  list.push({ id: fileId, note: note || "" });
   if (env.PENDING_IMAGES) {
     await env.PENDING_IMAGES.put(pendingKey(chatId), JSON.stringify(list), {
       expirationTtl: 3600,
@@ -204,6 +288,108 @@ async function takePending(env, chatId) {
     await env.PENDING_IMAGES.delete(pendingKey(chatId));
   }
   return list;
+}
+
+async function getVideo(env, chatId) {
+  try {
+    if (!env.PENDING_IMAGES) return null;
+    const raw = await env.PENDING_IMAGES.get(videoKey(chatId));
+    const v = JSON.parse(raw || "null");
+    if (v && (v.kind === "url" || v.kind === "video") && typeof v.ref === "string") {
+      return { kind: v.kind, ref: v.ref, prompt: String(v.prompt || "") };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+async function setVideo(env, chatId, video) {
+  if (env.PENDING_IMAGES) {
+    await env.PENDING_IMAGES.put(videoKey(chatId), JSON.stringify(video), {
+      expirationTtl: 3600,
+    });
+  }
+}
+
+async function clearVideo(env, chatId) {
+  if (env.PENDING_IMAGES) {
+    try {
+      await env.PENDING_IMAGES.delete(videoKey(chatId));
+    } catch {
+      // staging is best-effort; the TTL cleans up regardless
+    }
+  }
+}
+
+function fmtTime(sec) {
+  const s = Math.max(0, Math.round(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+// Free-form caption -> {start, end, label}. Accepts 0:20, 0:20-0:26,
+// 45s, 1m20s, @-prefixes — anything else falls back to best-fit placement.
+function parsePlacement(caption, fallbackLabel) {
+  const text = String(caption || "");
+  const spans = [];
+  const push = (v, i, len) => {
+    if (Number.isFinite(v) && v >= 0) spans.push({ v, i, len });
+  };
+  let m;
+  const mmss = /(\d+):(\d{1,2})/g;
+  while ((m = mmss.exec(text))) push(+m[1] * 60 + +m[2], m.index, m[0].length);
+  const mins = /(\d+)\s*m(?:in(?:ute)?s?)?(?:\s*(\d+(?:\.\d+)?)\s*s)?/gi;
+  const minSpans = [];
+  while ((m = mins.exec(text))) {
+    push(+m[1] * 60 + (m[2] != null ? +m[2] : 0), m.index, m[0].length);
+    minSpans.push([m.index, m.index + m[0].length]);
+  }
+  const secs = /(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?\b/gi;
+  while ((m = secs.exec(text))) {
+    const s = m.index;
+    const e = s + m[0].length;
+    if (minSpans.some(([a, b]) => s >= a && e <= b)) continue; // inside 1m20s
+    push(+m[1], s, m[0].length);
+  }
+  spans.sort((a, b) => a.i - b.i);
+  let start = null;
+  let end = null;
+  if (spans.length) {
+    start = spans[0].v;
+    if (spans.length > 1) {
+      const between = text.slice(spans[0].i + spans[0].len, spans[1].i);
+      if (/^\s*(?:-|–|—|to)\s*$/i.test(between)) end = spans[1].v;
+    }
+  }
+  let label = text;
+  const cut = spans
+    .map((t) => [t.i, t.i + t.len])
+    .sort((a, b) => b[0] - a[0]);
+  for (const [a, b] of cut) label = `${label.slice(0, a)} ${label.slice(b)}`;
+  label = label.replace(/[-–—@,;:()[\]]/g, " ");
+  label = label.replace(/\b(place|put|show|add|use|display|overlay)\b/gi, " ");
+  label = label.replace(/\b(at|on|from|around|near|about|during|when|where)\b/gi, " ");
+  label = label.replace(/\s+/g, " ").trim();
+  if (!label) label = fallbackLabel;
+  return { start, end, label };
+}
+
+function buildPrompt(base, imgs) {
+  const lines = imgs.map((im, k) => {
+    const p = parsePlacement(im.note || "", `image ${k + 1}`);
+    const when =
+      p.start == null
+        ? "place where it fits best"
+        : p.end == null
+          ? `from ${fmtTime(p.start)}`
+          : `${fmtTime(p.start)}–${fmtTime(p.end)}`;
+    return `- image-${k + 1} (${p.label}): ${when}`;
+  });
+  if (!lines.length) return base;
+  return (
+    `${base}\n\nStaged images ` +
+    `(attachments image-1..image-${imgs.length}, match by name stem):\n${lines.join("\n")}`
+  );
 }
 
 function normalizedInputs(inputs) {

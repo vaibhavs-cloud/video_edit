@@ -44,9 +44,7 @@ def acquire(input_ref: str, dest: Path, cfg: Config) -> tuple[Path, str]:
         if _is_drive(input_ref):
             import gdown
 
-            result = gdown.download(
-                url=input_ref, output=str(dest), quiet=True, fuzzy=True
-            )
+            result = gdown.download(url=input_ref, output=str(dest), quiet=True)
             if not result or not dest.exists() or dest.stat().st_size == 0:
                 raise AcquireError(f"gdown could not fetch {input_ref}")
             return dest, "url"

@@ -11,7 +11,7 @@
 - Still untested: the worker's **>20 MB attachment → "send a Drive link"**
   reply (no >20 MB video was ever sent to the bot).
 
-## 3. SESSION HANDOFF 2026-09-27 — worker batch-mode deploy PENDING (clean stop point)
+## 3. SESSION HANDOFF 2026-09-27 — worker batch-mode deploy ✅ DONE 2026-09-28
 
 **Milestone reached:** all batch-mode code is committed, pushed (`61b2d44`),
 CI green (`test.yml` success on `61b2d44`). Python pipeline already supports
@@ -55,6 +55,16 @@ from repo lines 344-393, verify hash, then assemble.
 header from keys.txt): photo-with-caption stage → video stage → `done` →
 watch `edit.yml` run → confirm `[attach] image-1.jpg`, placement in plan,
 QC PASS, delivery. Then tell the owner batch mode is live.
+
+**DEPLOYED 2026-09-28 via `opencode run` subagent** (this session has no MCP
+tools, but the installed opencode CLI 1.18.32 loads them with the cached
+OAuth — use that path again if MCP is ever missing here): 16 replacements,
+live precheck 8195/0x4885f78f PASS, upload gate 14991/0x57ae6541 PASS.
+Batch-worker verified live: video stages with NO run; `done` dispatched run
+`36390787331` → `[attach] image-1.jpg`, caption parsed to
+`- image-1 (pyramid): from 0:20`, planner placed screenshot at words 36–47
+(15.9–19.3s), 1/1 resolved, QC PASS, delivered. Batch mode is live —
+`done`/`cancel`/captioned placements all work.
 
 **SESSION CONSTRAINT 2026-09-28:** the `cloudflare-personal` MCP tool is
 absent from this session's toolset, and there is no other Cloudflare write

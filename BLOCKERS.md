@@ -64,6 +64,16 @@ browser anyway). The deploy above can only run where the
 `cloudflare-personal` MCP tools are loaded (they carry the auth). Resume
 there with one deploy call; everything else is done and green.
 
+**MCP DIAGNOSIS (same day, nothing is broken):** `cloudflare-personal` is
+correctly configured (`~/.config/opencode/opencode.jsonc`, remote
+`https://mcp.cloudflare.com/mcp`) and its OAuth grant is cached on this
+machine (`~/.local/share/opencode/mcp-auth.json` has all five Cloudflare
+servers) — but its access token expired 2026-09-27 19:46 UTC. This session
+loads zero MCP tools, so there is no channel at all. In a normal local
+session opencode should refresh the token automatically on connect; if a
+Cloudflare MCP call 401s there instead, delete the stale grant / re-login
+to Cloudflare and retry.
+
 ## 2. Resolved during this session (kept for the record)
 
 - Telegram relay dispatch failed with `github dispatch 403: Request

@@ -56,6 +56,14 @@ header from keys.txt): photo-with-caption stage → video stage → `done` →
 watch `edit.yml` run → confirm `[attach] image-1.jpg`, placement in plan,
 QC PASS, delivery. Then tell the owner batch mode is live.
 
+**SESSION CONSTRAINT 2026-09-28:** the `cloudflare-personal` MCP tool is
+absent from this session's toolset, and there is no other Cloudflare write
+path here — no `CLOUDFLARE_*` env vars, no wrangler config dirs, wrangler
+not installed (`npx wrangler whoami` hangs; OAuth login would need a
+browser anyway). The deploy above can only run where the
+`cloudflare-personal` MCP tools are loaded (they carry the auth). Resume
+there with one deploy call; everything else is done and green.
+
 ## 2. Resolved during this session (kept for the record)
 
 - Telegram relay dispatch failed with `github dispatch 403: Request

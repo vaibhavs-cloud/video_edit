@@ -1,7 +1,7 @@
 """Audio extraction + deterministic voice enhancement.
 
 Fixed filter chain (versioned here, not scattered across the codebase):
-    highpass -> afftdn -> acompressor -> two-pass loudnorm
+    highpass -> bass_boost (low-shelf, optional) -> afftdn -> acompressor -> two-pass loudnorm
 
 Everything is length-preserving, so the enhanced track stays aligned with the
 source timeline and can be cut with the exact same bounds as the video.
@@ -13,6 +13,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
 
 from vedit import ff
 from vedit.config import Config
@@ -29,17 +30,30 @@ class AudioPaths:
     stt_16k: Path
 
 
+class LoudnormMeasured(TypedDict):
+    input_i: str
+    input_tp: str
+    input_lra: str
+    input_thresh: str
+    target_offset: str
+
+
 def _base_filters(cfg: Config) -> str:
     a = cfg.audio
-    return (
-        f"highpass=f={a.highpass_hz},"
-        f"afftdn=nf={a.afftdn_nf},"
+    parts = [f"highpass=f={a.highpass_hz}"]
+    if a.bass_boost_gain_db:
+        parts.append(
+            f"equalizer=f={a.bass_boost_hz}:t=h:w={a.bass_boost_width}:g={a.bass_boost_gain_db}"
+        )
+    parts.append(f"afftdn=nf={a.afftdn_nf}")
+    parts.append(
         f"acompressor=threshold={a.comp_threshold_db}dB:ratio={a.comp_ratio}:"
         f"attack={a.comp_attack_ms}:release={a.comp_release_ms}"
     )
+    return ",".join(parts)
 
 
-def _measure(cfg: Config, raw: Path) -> dict:
+def _measure(cfg: Config, raw: Path) -> LoudnormMeasured:
     a = cfg.audio
     filt = (
         f"{_base_filters(cfg)},"
@@ -56,7 +70,7 @@ def _measure(cfg: Config, raw: Path) -> dict:
     return json.loads(matches[-1])
 
 
-def _enhance_filter(cfg: Config, measured: dict | None) -> str:
+def _enhance_filter(cfg: Config, measured: LoudnormMeasured | None) -> str:
     a = cfg.audio
     if measured is None:
         return f"{_base_filters(cfg)},loudnorm=I={a.loudnorm_i}:TP={a.loudnorm_tp}:LRA={a.loudnorm_lra}"

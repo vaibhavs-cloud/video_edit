@@ -351,7 +351,7 @@ def s_render(ctx: Ctx) -> None:
     segments = render.render_segments(
         plan, resolved, base, ctx.work / "audio" / "clean_48k.wav", ctx.work, ctx.cfg
     )
-    merged = render.concat(segments, ctx.work)
+    merged = render.concat_crossfade(segments, ctx.work, ctx.cfg)
     render.burn_captions(merged, ctx.work, FONTS_DIR, ctx.state / "final.mp4", ctx.cfg)
     _log(f"[render] final.mp4 ({len(segments)} segments)")
 

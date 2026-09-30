@@ -32,11 +32,17 @@ class CutsCfg:
     silence_merge_gap_ms: int
     silence_pad_ms: int
     word_drop_min_s: float
+    # segment-boundary crossfades; 0 = hard cut (legacy lossless concat)
+    crossfade_video_ms: int = 0
+    crossfade_audio_ms: int = 0
 
 
 @dataclass(frozen=True)
 class AudioCfg:
     highpass_hz: int
+    bass_boost_hz: int
+    bass_boost_gain_db: float
+    bass_boost_width: float
     afftdn_nf: int
     comp_threshold_db: int
     comp_ratio: int
@@ -58,6 +64,7 @@ class VideoCfg:
     x264_preset: str
     x264_crf: int
     audio_bitrate: str
+    encode_workers: int = 2
 
 
 @dataclass(frozen=True)

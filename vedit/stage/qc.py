@@ -52,10 +52,19 @@ def run_qc(
 ) -> QcResult:
     result = QcResult()
     timeline = TimelineMap(plan.segments)
-    expected = timeline.output_dur
+    # Crossfade joins blend the boundary frames, shortening the output by one
+    # overlap per join vs. the lossless-concat timeline.
+    overlap = 0.0
+    if len(plan.segments) > 1:
+        if cfg.cuts.crossfade_video_ms > 0:
+            overlap = cfg.cuts.crossfade_video_ms / 1000.0
+        elif cfg.cuts.crossfade_audio_ms > 0:
+            overlap = cfg.cuts.crossfade_audio_ms / 1000.0
+    expected = max(0.0, timeline.output_dur - (len(plan.segments) - 1) * overlap)
     result.stats = {
         "expected_output_s": round(expected, 3),
         "segments": len(plan.segments),
+        "crossfade_overlap_s": round(overlap, 3),
         "visuals_planned": len(plan.visuals),
         "visuals_resolved": len(resolved_assets),
         "caption_lines": len(caption_lines),

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from vedit.schema import Visual
@@ -130,3 +132,87 @@ def test_cover_filters_execute_in_ffmpeg(tmp_path, cfg, transcript):
     ]
     ff.ffmpeg(args, timeout=120)
     assert (tmp_path / "o.mp4").stat().st_size > 0
+
+
+def _synthetic_segment(path: Path, dur: float, freq: int) -> Path:
+    from vedit import ff
+
+    ff.ffmpeg(
+        [
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"testsrc2=size=320x240:rate=30:duration={dur}",
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency={freq}:duration={dur}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "28",
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            "30",
+            "-c:a",
+            "aac",
+            "-ar",
+            "48000",
+            "-shortest",
+            str(path),
+        ],
+        timeout=120,
+    )
+    return path
+
+
+def test_crossfade_concat_duration_accounts_overlap(tmp_path, cfg):
+    """xfade/acrossfade output is shorter by (N-1) * overlap — the QC math."""
+    from vedit import ff
+
+    segs = [
+        _synthetic_segment(tmp_path / f"s{i}.mp4", 2.0, 440 + i * 110) for i in range(3)
+    ]
+    overlap = render.crossfade_overlap_s(cfg)
+    assert overlap > 0, "default config must enable crossfades"
+    merged = render.concat_crossfade(segs, tmp_path, cfg)
+    assert merged.stat().st_size > 0
+    dur = ff.duration_of(ff.probe(merged))
+    expected = sum(ff.duration_of(ff.probe(p)) for p in segs) - 2 * overlap
+    assert dur == pytest.approx(expected, abs=0.35)
+
+
+def test_crossfade_disabled_falls_back_to_lossless(tmp_path, cfg):
+    cfg2 = dataclasses.replace(
+        cfg,
+        cuts=dataclasses.replace(cfg.cuts, crossfade_video_ms=0, crossfade_audio_ms=0),
+    )
+    assert render.crossfade_overlap_s(cfg2) == 0.0
+    segs = [
+        _synthetic_segment(tmp_path / f"f{i}.mp4", 1.5, 440 + i * 110) for i in range(2)
+    ]
+    merged = render.concat_crossfade(segs, tmp_path, cfg2)
+    assert merged.stat().st_size > 0
+    from vedit import ff
+
+    dur = ff.duration_of(ff.probe(merged))
+    expected = sum(ff.duration_of(ff.probe(p)) for p in segs)
+    assert dur == pytest.approx(expected, abs=0.35)
+
+
+def test_segment_fingerprint_stable_and_sensitive(tmp_path, cfg):
+    asset = _shot(tmp_path)
+    base = tmp_path / "base.mp4"
+    base.write_bytes(b"fake-base")
+    clean = tmp_path / "clean.wav"
+    clean.write_bytes(b"fake-clean")
+    fp1 = render._segment_fingerprint(0.0, 2.5, [], False, base, clean, cfg)
+    fp2 = render._segment_fingerprint(0.0, 2.5, [], False, base, clean, cfg)
+    assert fp1 == fp2
+    assert render._segment_fingerprint(0.0, 2.5, [], True, base, clean, cfg) != fp1
+    assert render._segment_fingerprint(0.0, 3.0, [], False, base, clean, cfg) != fp1
+    assert asset.exists()

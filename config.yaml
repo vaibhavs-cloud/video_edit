@@ -8,6 +8,10 @@ cuts:
   cut_gap_ms: 600
   keep_gap_ms: 350
   pad_ms: 120
+  # segment-boundary crossfade; 0 = hard cut (legacy lossless concat).
+  # Each join shortens the output by the overlap, accounted for in QC.
+  crossfade_video_ms: 100
+  crossfade_audio_ms: 50
   min_kept_segment_ms: 500
   min_output_s: 40
   adaptive_multiplier: 1.8
@@ -23,6 +27,11 @@ cuts:
 
 audio:
   highpass_hz: 80
+  # low-shelf warmth lift before denoise (0 gain = disabled); boosted noise
+  # is still cleaned up by afftdn downstream
+  bass_boost_hz: 250
+  bass_boost_gain_db: 4
+  bass_boost_width: 1.5
   afftdn_nf: -30
   comp_threshold_db: -18
   comp_ratio: 3
@@ -42,6 +51,8 @@ video:
   x264_preset: veryfast
   x264_crf: 20
   audio_bitrate: 192k
+  # parallel segment encodes (segment files are independent)
+  encode_workers: 2
 
 visuals:
   icons_enabled: false # no Iconify overlays; only input images (screenshots) are placed

@@ -194,13 +194,13 @@ class PlanDraft(BaseModel):
     zoom_at_words: list[int] = Field(default_factory=list)
 
 
-class IconPicks(BaseModel):
-    picks: list[IconPick] = Field(default_factory=list)
-
-
 class IconPick(BaseModel):
     visual_id: str
     icon: str | None = None
+
+
+class IconPicks(BaseModel):
+    picks: list[IconPick] = Field(default_factory=list)
 
 
 # ---- Correction loop ----

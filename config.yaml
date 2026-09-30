@@ -26,13 +26,18 @@ cuts:
   word_drop_min_s: 0.5
 
 audio:
+  # mono extraction: speech-centric denoise/stt both downmix anyway, and
+  # stereo masking can hide noise that mono processing would catch
+  channels: 1
   highpass_hz: 80
   # low-shelf warmth lift before denoise (0 gain = disabled); boosted noise
   # is still cleaned up by afftdn downstream
   bass_boost_hz: 250
   bass_boost_gain_db: 4
   bass_boost_width: 1.5
+  # FFT denoiser: nf = noise floor, nr = per-band reduction (ffmpeg default 12)
   afftdn_nf: -30
+  denoise_reduction_db: 18
   comp_threshold_db: -18
   comp_ratio: 3
   comp_attack_ms: 10
@@ -40,6 +45,9 @@ audio:
   loudnorm_i: -16
   loudnorm_tp: -1.5
   loudnorm_lra: 11
+  # extra gain after loudnorm (0 = off); positive gains are limited back to
+  # loudnorm_tp so true peak never exceeds the ceiling
+  volume_gain_db: 3
 
 video:
   width: 1080

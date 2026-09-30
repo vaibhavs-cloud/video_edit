@@ -1,7 +1,8 @@
 """Audio extraction + deterministic voice enhancement.
 
 Fixed filter chain (versioned here, not scattered across the codebase):
-    highpass -> bass_boost (low-shelf, optional) -> afftdn -> acompressor -> two-pass loudnorm
+    highpass -> bass_boost (low-shelf, optional) -> afftdn -> acompressor
+    -> two-pass loudnorm -> volume boost (optional, peak-limited)
 
 Everything is length-preserving, so the enhanced track stays aligned with the
 source timeline and can be cut with the exact same bounds as the video.
@@ -45,7 +46,7 @@ def _base_filters(cfg: Config) -> str:
         parts.append(
             f"equalizer=f={a.bass_boost_hz}:t=h:w={a.bass_boost_width}:g={a.bass_boost_gain_db}"
         )
-    parts.append(f"afftdn=nf={a.afftdn_nf}")
+    parts.append(f"afftdn=nf={a.afftdn_nf}:nr={a.denoise_reduction_db:g}")
     parts.append(
         f"acompressor=threshold={a.comp_threshold_db}dB:ratio={a.comp_ratio}:"
         f"attack={a.comp_attack_ms}:release={a.comp_release_ms}"
@@ -73,14 +74,27 @@ def _measure(cfg: Config, raw: Path) -> LoudnormMeasured:
 def _enhance_filter(cfg: Config, measured: LoudnormMeasured | None) -> str:
     a = cfg.audio
     if measured is None:
-        return f"{_base_filters(cfg)},loudnorm=I={a.loudnorm_i}:TP={a.loudnorm_tp}:LRA={a.loudnorm_lra}"
-    return (
-        f"{_base_filters(cfg)},"
-        f"loudnorm=I={a.loudnorm_i}:TP={a.loudnorm_tp}:LRA={a.loudnorm_lra}:"
-        f"measured_I={measured['input_i']}:measured_TP={measured['input_tp']}:"
-        f"measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}:"
-        f"offset={measured['target_offset']}:linear=true"
-    )
+        chain = f"{_base_filters(cfg)},loudnorm=I={a.loudnorm_i}:TP={a.loudnorm_tp}:LRA={a.loudnorm_lra}"
+    else:
+        chain = (
+            f"{_base_filters(cfg)},"
+            f"loudnorm=I={a.loudnorm_i}:TP={a.loudnorm_tp}:LRA={a.loudnorm_lra}:"
+            f"measured_I={measured['input_i']}:measured_TP={measured['input_tp']}:"
+            f"measured_LRA={measured['input_lra']}:measured_thresh={measured['input_thresh']}:"
+            f"offset={measured['target_offset']}:linear=true"
+        )
+    if a.volume_gain_db > 0:
+        # Extra loudness after loudnorm. level=0 keeps the limiter transparent
+        # (no auto-level), latency=1 compensates the lookahead delay so the
+        # track stays time-aligned; both together preserve exact length.
+        limit = 10 ** (a.loudnorm_tp / 20.0)
+        chain += (
+            f",volume={a.volume_gain_db:g}dB,"
+            f"alimiter=limit={limit:.4f}:level=0:latency=1"
+        )
+    elif a.volume_gain_db < 0:
+        chain += f",volume={a.volume_gain_db:g}dB"
+    return chain
 
 
 def prepare(source: Path, workdir: Path, cfg: Config) -> AudioPaths:
@@ -97,7 +111,7 @@ def prepare(source: Path, workdir: Path, cfg: Config) -> AudioPaths:
                 str(source),
                 "-vn",
                 "-ac",
-                "2",
+                str(cfg.audio.channels),
                 "-ar",
                 "48000",
                 "-c:a",
@@ -107,7 +121,19 @@ def prepare(source: Path, workdir: Path, cfg: Config) -> AudioPaths:
         )
     if not clean.exists():
         measured = _measure(cfg, raw)
-        ff.ffmpeg(["-i", str(raw), "-af", _enhance_filter(cfg, measured), str(clean)])
+        # loudnorm processes internally at 192 kHz — pin the output rate so
+        # clean_48k.wav keeps its contract (and stays 4x smaller)
+        ff.ffmpeg(
+            [
+                "-i",
+                str(raw),
+                "-af",
+                _enhance_filter(cfg, measured),
+                "-ar",
+                "48000",
+                str(clean),
+            ]
+        )
     if not stt.exists():
         ff.ffmpeg(
             [

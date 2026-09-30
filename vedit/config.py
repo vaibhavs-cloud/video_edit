@@ -51,6 +51,10 @@ class AudioCfg:
     loudnorm_i: float
     loudnorm_tp: float
     loudnorm_lra: float
+    # new knobs default to legacy behavior (stereo, ffmpeg default nr, no boost)
+    channels: int = 2
+    denoise_reduction_db: float = 12
+    volume_gain_db: float = 0
 
 
 @dataclass(frozen=True)

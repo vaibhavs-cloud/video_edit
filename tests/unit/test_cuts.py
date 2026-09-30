@@ -4,7 +4,7 @@ import pytest
 
 from vedit import ff
 from vedit.schema import Word
-from vedit.stage.cuts import CutsError, compute_segments, correct_words
+from vedit.stage.cuts import CutsError, _merge_tiny, compute_segments, correct_words
 
 
 def _words(spans: list[tuple[float, list[tuple[float, float]]]]) -> list[Word]:
@@ -136,3 +136,33 @@ def test_detect_silences_parses_and_merges(monkeypatch, tmp_path):
     monkeypatch.setattr(ff, "run", lambda *a, **k: out)
     got = ff.detect_silences(tmp_path / "x.wav", -25.0, 0.4, 0.25)
     assert got == [(1.0, 2.2), (5.0, 5.8)]
+
+
+def test_merge_tiny_folds_toward_smaller_re_admitted_gap():
+    # island at [6.0, 6.4] between runs: left gap 1.0s, right gap 0.2s
+    segs = [(0.0, 5.0), (6.0, 6.4), (6.6, 12.0)]
+    assert _merge_tiny(segs, 0.5) == [(0.0, 5.0), (6.0, 12.0)]
+
+
+def test_merge_tiny_folds_left_when_left_gap_smaller():
+    # left gap 0.2s < right gap 1.4s -> fold into the left neighbour
+    segs = [(0.0, 5.0), (5.2, 5.6), (7.0, 12.0)]
+    assert _merge_tiny(segs, 0.5) == [(0.0, 5.6), (7.0, 12.0)]
+
+
+def test_merge_tiny_epsilon_boundary_keeps_segment():
+    # 0.4999999s reads below min_dur but within eps -> must NOT be re-glued
+    segs = [(0.0, 5.0), (6.0, 6.4999999), (7.0, 12.0)]
+    assert _merge_tiny(segs, 0.5) == segs
+
+
+def test_merge_tiny_leading_island_folds_forward():
+    segs = [(0.0, 0.4), (1.4, 6.0)]
+    assert _merge_tiny(segs, 0.5) == [(0.0, 6.0)]
+
+
+def test_merge_tiny_multiple_islands_drain():
+    segs = [(0.0, 5.0), (5.2, 5.6), (6.0, 6.1), (7.0, 12.0)]
+    merged = _merge_tiny(segs, 0.5)
+    assert len(merged) == 2
+    assert all(e - s >= 0.5 - 1e-6 for s, e in merged)

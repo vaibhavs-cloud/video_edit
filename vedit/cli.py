@@ -8,6 +8,7 @@ stage modules; this file only orchestrates.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 import time
@@ -33,9 +34,26 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 FONTS_DIR = Path(__file__).resolve().parent.parent / "assets" / "fonts"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+_LOG = logging.getLogger("vedit")
+
+
+def _setup_logging() -> None:
+    """Levelled logging: VEDIT_LOG_LEVEL=DEBUG|INFO|WARNING filters CI output."""
+    level = os.environ.get("VEDIT_LOG_LEVEL", "INFO").upper()
+    logging.basicConfig(
+        level=level,
+        format="%(levelname)s %(message)s",
+        stream=sys.stdout,
+    )
+    _LOG.setLevel(level)  # keep our records flowing even if root was configured
+
 
 def _log(msg: str) -> None:
-    print(msg, flush=True)
+    _LOG.info(msg)
+
+
+def _warn(msg: str) -> None:
+    _LOG.warning(msg)
 
 
 def _notify(chat_id: str, text: str) -> None:
@@ -45,7 +63,7 @@ def _notify(chat_id: str, text: str) -> None:
 
         Telegram().send_message(chat_id, text[:4000])
     except Exception as exc:  # noqa: BLE001 — a failed hint must not kill the run
-        _log(f"[notify] failed: {exc}")
+        _warn(f"[notify] failed: {exc}")
 
 
 @dataclass
@@ -318,13 +336,18 @@ def s_visuals(ctx: Ctx) -> None:
                             f"-> top candidate {candidates[0]}"
                         )
         except Exception as exc:  # noqa: BLE001 — iconify outage degrades visuals, not the run
-            _log(f"[visuals] shortlist/pick failed, continuing without icons: {exc}")
+            _warn(f"[visuals] shortlist/pick failed, continuing without icons: {exc}")
         for v in plan.visuals:
             if v.id in target_ids and v.kind == "icon" and picks.get(v.id):
                 v.icon = picks[v.id]
         st.save_model(ctx.state / "edit_plan.json", plan)
         resolved = visuals_stage.resolve_visuals(
-            plan.visuals, transcript, ctx.cfg, ctx.icons, ctx.attachments, on_error=_log
+            plan.visuals,
+            transcript,
+            ctx.cfg,
+            ctx.icons,
+            ctx.attachments,
+            on_error=_warn,
         )
 
     manifest = [
@@ -371,7 +394,7 @@ def s_qc(ctx: Ctx) -> None:
     st.save_json(ctx.state / "qc.json", result.as_dict())
     for check in result.checks:
         if not check["ok"]:
-            _log(
+            _warn(
                 f"[qc] {'FAIL' if check['severity'] == 'hard' else 'WARN'} {check['name']}: {check['detail']}"
             )
     _log(f"[qc] {'PASS' if result.passed else 'FAIL'}")
@@ -685,6 +708,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _setup_logging()
     _load_keys_file()
     args = build_parser().parse_args(argv)
     for attr in ("attachments",):

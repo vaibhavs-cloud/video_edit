@@ -96,6 +96,10 @@ def _merge_tiny(
 ) -> list[tuple[float, float]]:
     """Folding sub-minimum segments into their neighbour keeps the cut rhythm natural.
 
+    An island between two longer runs folds into whichever side re-admits less
+    of the silence the cut just removed — never blindly left, which could
+    re-span a pause on the larger of the two gaps.
+
     The epsilon matters: bounds are float arithmetic on rounded word times, so
     a 0.70s island must not read as 0.6999s and get glued back (re-admitting
     the pause the cut just removed).
@@ -103,16 +107,23 @@ def _merge_tiny(
     if not segments:
         return segments
     eps = 1e-6
-    merged = [segments[0]]
-    for seg in segments[1:]:
-        if (
-            seg[1] - seg[0] < min_dur - eps
-            or merged[-1][1] - merged[-1][0] < min_dur - eps
-        ):
-            merged[-1] = (merged[-1][0], seg[1])
+    segs = list(segments)
+    # every pass removes exactly one island, so this terminates
+    while len(segs) > 1:
+        idx = next((i for i, s in enumerate(segs) if s[1] - s[0] < min_dur - eps), None)
+        if idx is None:
+            break
+        seg = segs[idx]
+        left_gap = (seg[0] - segs[idx - 1][1]) if idx > 0 else float("inf")
+        right_gap = (segs[idx + 1][0] - seg[1]) if idx + 1 < len(segs) else float("inf")
+        if right_gap < left_gap:
+            segs[idx + 1] = (seg[0], segs[idx + 1][1])
+        elif idx > 0:
+            segs[idx - 1] = (segs[idx - 1][0], seg[1])
         else:
-            merged.append(seg)
-    return merged
+            segs[idx + 1] = (seg[0], segs[idx + 1][1])
+        del segs[idx]
+    return segs
 
 
 def _intervals(

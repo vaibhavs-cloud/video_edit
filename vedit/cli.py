@@ -482,19 +482,45 @@ def _deliver(ctx: Ctx) -> None:
     _log("[deliver] oversized: sent preview + contact sheet")
 
 
-def cmd_attach(args: argparse.Namespace) -> int:
-    """Download Telegram screenshot attachments into a run state (pre-process step)."""
+def _parse_file_ids(raw: str) -> list[str]:
+    """Attach file ids from a JSON array or CSV string.
+
+    Accepts plain id strings and worker-style {"id": ..., "note": ...}
+    objects (the relay stages images with notes); anything else is skipped.
+    Raises SystemExit on malformed JSON instead of a traceback.
+    """
     import json as _json
 
+    text = (raw or "").strip()
+    if not text:
+        return []
+    if text.startswith("{"):
+        raise SystemExit("bad --file-ids JSON: expected an array")
+    if text.startswith("["):
+        try:
+            items = _json.loads(text)
+        except ValueError as exc:
+            raise SystemExit(f"bad --file-ids JSON: {exc}") from exc
+        if not isinstance(items, list):
+            raise SystemExit("bad --file-ids JSON: expected an array")
+        out: list[str] = []
+        for item in items:
+            if isinstance(item, dict):
+                fid = item.get("id") or item.get("file_id")
+                if fid:
+                    out.append(str(fid))
+            elif isinstance(item, str) and item.strip():
+                out.append(item.strip())
+        return out
+    return [x.strip() for x in text.split(",") if x.strip()]
+
+
+def cmd_attach(args: argparse.Namespace) -> int:
+    """Download Telegram screenshot attachments into a run state (pre-process step)."""
     cfg = load_config(args.config)
     state = Path(args.state)
     (state / "attachments").mkdir(parents=True, exist_ok=True)
-    raw = args.file_ids.strip()
-    file_ids = (
-        _json.loads(raw)
-        if raw.startswith("[")
-        else [x.strip() for x in raw.split(",") if x.strip()]
-    )
+    file_ids = _parse_file_ids(args.file_ids)
     if not file_ids:
         _log("[attach] no file ids")
         return 0
@@ -556,7 +582,7 @@ def cmd_process(args: argparse.Namespace) -> int:
 
     qc_passed = _qc_result(ctx).passed if (state / "qc.json").exists() else False
     if args.chat_id and qc_passed:
-        _deliver(ctx)
+        _deliver_guarded(ctx)
     return 0 if qc_passed else 2
 
 
@@ -607,15 +633,37 @@ def cmd_fix(args: argparse.Namespace) -> int:
         return 0 if preview.get("ok") else 2
 
     try:
+        notes_prefix: list[str] = []
         if args.apply_preview:
             preview_file = state / "fix_preview.json"
             if not preview_file.exists():
                 raise SystemExit("no fix_preview.json — run fix --dry-run first")
             data = st.load_json(preview_file)
             if data.get("plan_hash") != fix_stage.plan_hash(plan):
-                raise SystemExit("plan changed since preview — re-run fix --dry-run")
-            patch = FixPatch.model_validate(data["patch"])
-            _log(f"[fix] applying previewed {patch.op.value} (no re-parse)")
+                # The YES authorized the instruction, not the byte-plan: the plan
+                # moved on (usually the owner's own later edit), so re-resolve
+                # the same instruction deterministically instead of refusing.
+                instruction = (data.get("instruction") or "").strip()
+                if not instruction:
+                    raise SystemExit(
+                        "plan changed since preview and it carries no "
+                        "instruction — re-run fix --dry-run"
+                    )
+                _log("[fix] preview stale (plan moved on) — re-resolving instruction")
+                patch = fix_stage.parse_fix(
+                    instruction,
+                    plan,
+                    transcript,
+                    cfg,
+                    mock=ctx.mock,
+                    screenshots=shots,
+                )
+                notes_prefix.append(
+                    "re-resolved after plan drift (preview was for an older plan)"
+                )
+            else:
+                patch = FixPatch.model_validate(data["patch"])
+                _log(f"[fix] applying previewed {patch.op.value} (no re-parse)")
         else:
             patch = fix_stage.parse_fix(
                 args.instruction,
@@ -633,6 +681,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
             screenshots=shots,
             max_zooms=zoom_cap,
         )
+        notes = notes_prefix + notes
     except fix_stage.FixError as exc:
         _log(f"[fix] {exc}")
         if ctx.chat_id:
@@ -657,8 +706,28 @@ def cmd_fix(args: argparse.Namespace) -> int:
 
     qc_passed = _qc_result(ctx).passed
     if ctx.chat_id and qc_passed:
-        _deliver(ctx)
+        _deliver_guarded(ctx)
     return 0 if qc_passed else 2
+
+
+def _deliver_guarded(ctx: Ctx) -> None:
+    """Deliver, persisting a human-readable error for the workflow failure step.
+
+    A rendered, QC-passed video must never die silently at the send call:
+    the message tells the owner the video is ready and how to retry.
+    """
+    try:
+        _deliver(ctx)
+    except Exception as exc:
+        try:
+            (ctx.state / "last_error.txt").write_text(
+                f"video ready but delivery failed: {exc}\n"
+                "reply 'resend' and I'll try again",
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+        raise
 
 
 def cmd_qc(args: argparse.Namespace) -> int:
@@ -690,7 +759,7 @@ def cmd_deliver(args: argparse.Namespace) -> int:
         raise SystemExit("no chat_id: pass --chat-id or set it at process time")
     if not _qc_result(ctx).passed:
         raise SystemExit("QC has not passed — delivery is blocked")
-    _deliver(ctx)
+    _deliver_guarded(ctx)
     return 0
 
 

@@ -7,6 +7,7 @@ and pushes results, enforcing the bot API size limits from config.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,46 @@ import httpx
 
 class TelegramError(RuntimeError):
     pass
+
+
+def _retry_after_s(resp: httpx.Response) -> int:
+    try:
+        return max(0, int(resp.json().get("parameters", {}).get("retry_after", 2)))
+    except Exception:  # noqa: BLE001 — best-effort parse
+        return 2
+
+
+def _post(url: str, *, data=None, json=None, files=None, timeout=60) -> httpx.Response:
+    """POST with retries for transient failures (timeouts, 5xx, 429 flood waits).
+
+    4xx other than 429 are permanent (bad request, bad file_id) and fail fast.
+    File payloads must be bytes (not open handles) so attempts can re-send.
+    """
+    last: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = httpx.post(url, data=data, json=json, files=files, timeout=timeout)
+        except (
+            httpx.TimeoutException,
+            httpx.ConnectError,
+            httpx.RemoteProtocolError,
+        ) as exc:
+            last = exc
+        else:
+            if resp.status_code == 429:
+                wait = _retry_after_s(resp)
+                time.sleep(min(wait + 1, 60))
+                last = TelegramError(f"telegram 429, retry after {wait}s")
+                continue
+            if resp.status_code >= 500:
+                last = TelegramError(f"telegram {resp.status_code}")
+                time.sleep(min(2**attempt, 8))
+                continue
+            return resp
+        if attempt < 2:
+            time.sleep(min(2**attempt, 8))
+    assert last is not None
+    raise last
 
 
 class Telegram:
@@ -62,7 +103,7 @@ class Telegram:
 
     def send_message(self, chat_id: str, text: str) -> None:
         self._ok(
-            httpx.post(
+            _post(
                 self._url("sendMessage"),
                 json={"chat_id": chat_id, "text": text[:4000]},
                 timeout=60,
@@ -70,30 +111,30 @@ class Telegram:
         )
 
     def send_video(self, chat_id: str, path: Path, caption: str = "") -> None:
-        with path.open("rb") as fh:
-            self._ok(
-                httpx.post(
-                    self._url("sendVideo"),
-                    data={
-                        "chat_id": chat_id,
-                        "caption": caption[:1000],
-                        "supports_streaming": "true",
-                    },
-                    files={"video": (path.name, fh, "video/mp4")},
-                    timeout=600,
-                )
+        payload = path.read_bytes()
+        self._ok(
+            _post(
+                self._url("sendVideo"),
+                data={
+                    "chat_id": chat_id,
+                    "caption": caption[:1000],
+                    "supports_streaming": "true",
+                },
+                files={"video": (path.name, payload, "video/mp4")},
+                timeout=600,
             )
+        )
 
     def send_photo(self, chat_id: str, path: Path, caption: str = "") -> None:
-        with path.open("rb") as fh:
-            self._ok(
-                httpx.post(
-                    self._url("sendPhoto"),
-                    data={"chat_id": chat_id, "caption": caption[:1000]},
-                    files={"photo": (path.name, fh, "image/jpeg")},
-                    timeout=120,
-                )
+        payload = path.read_bytes()
+        self._ok(
+            _post(
+                self._url("sendPhoto"),
+                data={"chat_id": chat_id, "caption": caption[:1000]},
+                files={"photo": (path.name, payload, "image/jpeg")},
+                timeout=120,
             )
+        )
 
     def close(self) -> None:
         self._client.close()

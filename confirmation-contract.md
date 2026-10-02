@@ -28,6 +28,12 @@ the confirmation + tagged frame to Telegram from the workflow, uploads
 `--apply-preview`, delivers as usual). State artifacts are never uploaded by
 dry-run runs.
 
+Redelivery without re-render: `kind=deliver` downloads the latest state
+artifact and runs `vedit deliver` (QC-gated). The talker sends it for resend
+intents ("send it again", "I didn't get the video") with no preview step —
+the file already exists. Delivery failures persist `last_error.txt`, which
+the workflow failure step sends instead of the generic message.
+
 ## Commands (run in the worker sandbox, same `--config`)
 
 1. Preview (never mutates run state except `fix_preview.json` + `preview/`):

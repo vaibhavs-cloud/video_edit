@@ -118,7 +118,9 @@ async function handleUpdate(update, env) {
           chat_id: chatId,
           state_ref: stateRef[0],
           instruction: text,
-          attachments: JSON.stringify(await takePending(env, chatId)),
+          attachments: JSON.stringify(
+            (await takePending(env, chatId)).map((im) => im.id),
+          ),
         });
         await sendText(env, chatId, `queued fix ${stateRef[0]} — new cut coming`);
         return;
@@ -335,7 +337,25 @@ async function chatTurn(env, chatId, { text, replyRef, pending }) {
       chat_id: chatId,
       state_ref: ref,
       instruction,
-      attachments: JSON.stringify(await takePending(env, chatId)),
+      attachments: JSON.stringify((await takePending(env, chatId)).map((im) => im.id)),
+    });
+    return;
+  }
+  if (talk.action === "deliver") {
+    const ref = talk.state_ref || replyRef || lastState;
+    if (!ref) {
+      await sendText(
+        env,
+        chatId,
+        "which video should I send? Reply to a delivered video.",
+      );
+      return;
+    }
+    await dispatch(env, {
+      kind: "deliver",
+      chat_id: chatId,
+      state_ref: ref,
+      instruction: "",
     });
     return;
   }
@@ -557,7 +577,7 @@ function salvageTalkerJson(text) {
       return m ? JSON.parse('"' + m[1] + '"') : "";
     };
     const action = grab("action");
-    if (!/^(chat|fix|yes|no|adjust)$/.test(action)) return null;
+    if (!/^(chat|fix|yes|no|adjust|deliver)$/.test(action)) return null;
     return {
       action,
       reply: String(grab("reply")).slice(0, 1000),
@@ -590,7 +610,7 @@ async function askTalker(env, ctx) {
     "You CANNOT: music, effects, new footage, speed changes, caption styling. " +
     "Say so plainly and offer the closest alternative.\n\n" +
     "Decide ONE action, reply with raw JSON only:\n" +
-    '{"action": "chat|fix|yes|no|adjust", ' +
+    '{"action": "chat|fix|yes|no|adjust|deliver", ' +
     '"reply": "<message to send the owner NOW>", ' +
     '"instruction": "<self-contained edit text for fix/adjust>", ' +
     '"state_ref": "<8hex ref the edit targets, echo from context>"}\n' +
@@ -604,7 +624,8 @@ async function askTalker(env, ctx) {
     "- Pending exists: affirmations (yes/yess/yeah/yup/do it/go/confirm/ok/okay/done/this one/do this) are YES, always — never chat. Rejections are NO. Status questions ('is it done?', 'are you working on it') get reassurance with a time expectation, never 'which video?'.\n" +
     "- YES acks must set a time expectation ('Applying now — new cut lands here in a few minutes.') and never claim instant completion. A just-confirmed edit in conversation history answers later status questions the same way.\n" +
     "- Fix requested but no state ref exists anywhere: action chat, reply asks which video.\n" +
-    "- Pending exists but the message is unrelated chit-chat: action chat, leave pending alone.";
+    "- Pending exists but the message is unrelated chit-chat: action chat, leave pending alone.\n" +
+    "- deliver: resend the finished video ('send it again', 'I didn't get the video'). No preview needed — the file already exists. reply = short ack.";
   const messages = [
     { role: "system", content: system },
     ...ctx.turns.map((t) => ({

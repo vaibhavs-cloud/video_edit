@@ -691,3 +691,117 @@ def test_cli_fix_apply_preview_refuses_on_drift(tmp_path, edit_plan, transcript)
                 str(root / "config.yaml"),
             ]
         )
+
+
+def _write_min_state(tmp_path, edit_plan, transcript, name="ministate"):
+    import json
+    from pathlib import Path
+
+    from vedit.schema import StateMeta
+
+    state = Path(tmp_path) / name
+    state.mkdir()
+    (state / "edit_plan.json").write_text(edit_plan.model_dump_json(), encoding="utf-8")
+    (state / "transcript.json").write_text(
+        transcript.model_dump_json(), encoding="utf-8"
+    )
+    (state / "segments.json").write_text(
+        json.dumps([s.model_dump() for s in edit_plan.segments]), encoding="utf-8"
+    )
+    meta = StateMeta(
+        ref="t",
+        sha256="0" * 64,
+        source_kind="local",
+        source_ref="",
+        chat_id="",
+        mock=True,
+    )
+    (state / "meta.json").write_text(meta.model_dump_json(), encoding="utf-8")
+    (state / "notes.json").write_text("[]", encoding="utf-8")
+    (state / "qc.json").write_text(
+        json.dumps({"passed": True, "checks": [], "stats": {}}), encoding="utf-8"
+    )
+    return state
+
+
+def test_cli_fix_apply_preview_reresolves_on_drift(
+    tmp_path, edit_plan, transcript, monkeypatch
+):
+    import json
+    from pathlib import Path
+
+    import vedit.cli as cli_module
+    from vedit.cli import main
+
+    root = Path(__file__).resolve().parent.parent.parent
+    state = _write_min_state(tmp_path, edit_plan, transcript)
+    (state / "fix_preview.json").write_text(
+        json.dumps(
+            {
+                "plan_hash": "stale",
+                "op": "cut_range",
+                "instruction": "cut 0:05 to 0:10",
+                "patch": {"op": "cut_range", "from_word": 0, "to_word": 1},
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cli_module, "_run_stages", lambda *a, **k: None)
+    rc = main(
+        [
+            "fix",
+            "--state",
+            str(state),
+            "--apply-preview",
+            "--config",
+            str(root / "config.yaml"),
+        ]
+    )
+    assert rc == 0
+    notes = json.loads((state / "notes.json").read_text(encoding="utf-8"))
+    assert any("re-resolved after plan drift" in n for n in notes)
+    after = json.loads((state / "edit_plan.json").read_text(encoding="utf-8"))
+    assert after["segments"], "cut must leave surviving segments"
+
+
+def test_parse_file_ids_accepts_objects_csv_and_rejects_garbage():
+    from vedit.cli import _parse_file_ids
+
+    assert _parse_file_ids("") == []
+    assert _parse_file_ids("a,b , c") == ["a", "b", "c"]
+    assert _parse_file_ids('["a", "b"]') == ["a", "b"]
+    assert _parse_file_ids('[{"id": "a", "note": ""}, {"file_id": "b"}]') == [
+        "a",
+        "b",
+    ]
+    assert _parse_file_ids("[123, null]") == []
+    with pytest.raises(SystemExit, match="bad --file-ids JSON"):
+        _parse_file_ids("[invalid")
+    with pytest.raises(SystemExit, match="expected an array"):
+        _parse_file_ids('{"id": "a"}')
+
+
+def test_deliver_guard_records_error_file(tmp_path, edit_plan, transcript, monkeypatch):
+    import json
+    from pathlib import Path
+
+    from vedit.cli import main
+
+    root = Path(__file__).resolve().parent.parent.parent
+    state = _write_min_state(tmp_path, edit_plan, transcript, name="delv")
+    (state / "probe.json").write_text(json.dumps({"dur": 10.0}), encoding="utf-8")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "x")
+    with pytest.raises(FileNotFoundError):
+        main(
+            [
+                "deliver",
+                "--state",
+                str(state),
+                "--chat-id",
+                "1",
+                "--config",
+                str(root / "config.yaml"),
+            ]
+        )
+    err = (state / "last_error.txt").read_text(encoding="utf-8")
+    assert "delivery failed" in err and "resend" in err

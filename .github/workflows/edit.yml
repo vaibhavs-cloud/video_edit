@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # Worker + manual "Run workflow" share these inputs
     inputs:
       kind:
-        description: "new | fix | fix-dryrun | fix-apply"
+        description: "new | fix | fix-dryrun | fix-apply | deliver"
         type: string
         required: true
         default: "new"
@@ -69,7 +69,7 @@ jobs:
         run: python -m pip install -r requirements.txt
 
       - name: Download prior state (kind=fix*)
-        if: inputs.kind == 'fix' || inputs.kind == 'fix-dryrun' || inputs.kind == 'fix-apply'
+        if: inputs.kind == 'fix' || inputs.kind == 'fix-dryrun' || inputs.kind == 'fix-apply' || inputs.kind == 'deliver'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           STATE_REF: ${{ inputs.state_ref }}
@@ -137,6 +137,8 @@ jobs:
             python -m vedit fix --state out/run --instruction "$INSTRUCTION" --dry-run
           elif [ "$KIND" = "fix-apply" ]; then
             python -m vedit fix --state out/run --apply-preview --chat-id "$CHAT_ID"
+          elif [ "$KIND" = "deliver" ]; then
+            python -m vedit deliver --state out/run --chat-id "$CHAT_ID"
           else
             if [ -z "$IN_URL" ] && [ -z "$IN_FILE_ID" ]; then
               echo "::error::kind=new requires url or video_file_id"
@@ -205,14 +207,18 @@ jobs:
           base = f"https://api.telegram.org/bot{token}"
           report = pathlib.Path("out/run/edit_report.md")
           text = "run failed — no video produced"
-          preview_file = pathlib.Path("out/run/fix_preview.json")
-          if preview_file.exists():
-              try:
-                  preview = json.loads(preview_file.read_text(encoding="utf-8"))
-                  if not preview.get("ok"):
-                      text = f"can't do that yet: {preview.get('error', 'unknown error')}"
-              except ValueError:
-                  pass
+          err_file = pathlib.Path("out/run/last_error.txt")
+          if err_file.exists():
+              text = err_file.read_text(encoding="utf-8")[:3500]
+          else:
+              preview_file = pathlib.Path("out/run/fix_preview.json")
+              if preview_file.exists():
+                  try:
+                      preview = json.loads(preview_file.read_text(encoding="utf-8"))
+                      if not preview.get("ok"):
+                          text = f"can't do that yet: {preview.get('error', 'unknown error')}"
+                  except ValueError:
+                      pass
           if text.startswith("run failed"):
               if report.exists():
                   text = report.read_text(encoding="utf-8")[:3500]
@@ -235,7 +241,7 @@ jobs:
           echo "sha8=${SHA:0:8}" >> "$GITHUB_OUTPUT"
 
       - name: Upload state artifact
-        if: steps.run.outcome == 'success' && inputs.kind != 'fix-dryrun'
+        if: steps.run.outcome == 'success' && inputs.kind != 'fix-dryrun' && inputs.kind != 'deliver'
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ steps.ref.outputs.sha8 }}

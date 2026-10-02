@@ -491,6 +491,63 @@ def test_parse_fix_remove_visual_still_wins(edit_plan, transcript, cfg):
     assert p.op == FixOp.remove_visual
 
 
+def test_resize_visual_by_id_and_scale(edit_plan, transcript):
+    v0 = edit_plan.visuals[0]
+    out, notes = apply_patch(
+        FixPatch(op=FixOp.resize_visual, visual_id=v0.id, scale=0.5),
+        edit_plan,
+        transcript,
+    )
+    got = next(v for v in out.visuals if v.id == v0.id)
+    assert got.scale == 0.5
+    assert any("resize_visual" in n and "0.50" in n for n in notes)
+
+
+def test_resize_visual_out_of_range_rejected(edit_plan, transcript):
+    v0 = edit_plan.visuals[0]
+    with pytest.raises(FixError, match="invalid plan"):
+        apply_patch(
+            FixPatch(op=FixOp.resize_visual, visual_id=v0.id, scale=5.0),
+            edit_plan,
+            transcript,
+        )
+
+
+def test_resize_visual_needs_target_and_size(edit_plan, transcript):
+    with pytest.raises(FixError, match="which visual"):
+        apply_patch(FixPatch(op=FixOp.resize_visual, scale=0.5), edit_plan, transcript)
+    v0 = edit_plan.visuals[0]
+    with pytest.raises(FixError, match="how small"):
+        apply_patch(
+            FixPatch(op=FixOp.resize_visual, visual_id=v0.id), edit_plan, transcript
+        )
+
+
+def test_resize_visual_targets_covering_word(edit_plan, transcript):
+    v0 = edit_plan.visuals[0]
+    mid = (v0.from_word + v0.to_word) // 2
+    out, _notes = apply_patch(
+        FixPatch(op=FixOp.resize_visual, from_word=mid, to_word=mid, scale=0.6),
+        edit_plan,
+        transcript,
+    )
+    got = next(v for v in out.visuals if v.id == v0.id)
+    assert got.scale == 0.6
+
+
+def test_parse_fix_mock_resize_heuristic(edit_plan, transcript, cfg):
+    p = parse_fix(
+        "make the image smaller at 0:15",
+        edit_plan,
+        transcript,
+        cfg,
+        mock=True,
+        screenshots=["diagram.png"],
+    )
+    assert p.op == FixOp.resize_visual
+    assert p.scale == 0.7
+
+
 def test_preview_fix_place_reports_both_timelines(edit_plan, transcript, segments, cfg):
     from vedit.stage.fix import confirmation_text, preview_fix
 

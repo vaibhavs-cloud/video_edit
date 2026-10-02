@@ -70,6 +70,7 @@ class Visual(BaseModel):
     to_word: int = Field(ge=0)
     pos: Literal["top", "bottom", "top-right", "top-left", "center"] = "top-right"
     zoom: bool = False
+    scale: float = Field(default=1.0, ge=0.2, le=1.0)  # fraction of natural size
 
     @model_validator(mode="after")
     def _check(self) -> Visual:
@@ -216,6 +217,7 @@ class FixOp(str, Enum):
     keep_range = "keep_range"
     add_zoom = "add_zoom"
     remove_zoom = "remove_zoom"
+    resize_visual = "resize_visual"
     unknown = "unknown"
 
 
@@ -227,6 +229,7 @@ class FixPatch(BaseModel):
     to_word: int | None = None
     text: str | None = None
     file: str | None = None
+    scale: float | None = None
     note: str | None = None
 
 

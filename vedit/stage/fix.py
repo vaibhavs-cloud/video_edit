@@ -33,6 +33,7 @@ from vedit.schema import (
 )
 from vedit.stage.anchor import (
     AnchorError,
+    parse_scale,
     parse_time_tokens,
     resolve_point,
     resolve_span,
@@ -51,7 +52,8 @@ SUPPORTED = (
     '"add it to this video") · remove the visual · recaption a span '
     '("recaption 0:45: ...") · retime a visual ("move the visual at 0:20 to '
     '0:30") · cut a span ("cut 0:30 to 0:45") · keep only a span '
-    '("keep only 0:10 to 1:00") · add/remove a zoom ("zoom in at 0:30"). '
+    '("keep only 0:10 to 1:00") · add/remove a zoom ("zoom in at 0:30") · '
+    'resize an overlay ("make the image smaller", "shrink it to 60%"). '
     "Silence cutting is automatic — report surviving pauses and the cut "
     "settings get tuned instead."
 )
@@ -114,6 +116,7 @@ OPS (pick exactly one):
 - keep_range: keep ONLY a span and cut everything else; set from_word + to_word. E.g. "keep only 0:10 to 1:00".
 - add_zoom: emphasis zoom at a moment; set from_word (a named time or phrase maps here). E.g. "zoom in at 0:30".
 - remove_zoom: drop zoom(s) near a time; set from_word + to_word. E.g. "remove the zoom at 0:30".
+- resize_visual: shrink/grow an overlay to a fraction of the frame; set visual_id (or a time naming it) + the size, which is matched exactly by code from explicit percents/words ("60%", "half", "smaller"). E.g. "make the image at 0:58 smaller", "shrink the diagram to 60%", "zoom out the image".
 - add_visual: place an input image; set file (exactly one of AVAILABLE SCREENSHOTS) + from_word + to_word (source word indices, inside one segment; an explicit time in the instruction is matched exactly to the transcript by code). If the instruction says to add the image without naming one, omit file and the first available screenshot is used. If it names no time or words, omit from_word/to_word and the image goes near the start (it can be retimed after).
 - unknown: the instruction is not about visuals or captions at all
 
@@ -163,6 +166,20 @@ def _mock_patch(instruction: str, plan: EditPlan, screenshots: list[str]) -> Fix
         c = plan.captions[0] if plan.captions else None
         w = c.from_word if c else 0
         return FixPatch(op=FixOp.add_zoom, from_word=w, to_word=w)
+    if (
+        "resize" in text
+        or "zoom out" in text
+        or "smaller" in text
+        or "bigger" in text
+        or "shrink" in text
+        or "scale" in text
+        or "%" in text
+    ) and plan.visuals:
+        target = next(
+            (v for v in plan.visuals if v.kind == "screenshot"),
+            plan.visuals[0],
+        )
+        return FixPatch(op=FixOp.resize_visual, visual_id=target.id)
     if "remove" in text and plan.visuals:
         return FixPatch(op=FixOp.remove_visual, visual_id=plan.visuals[0].id)
     if ("shield" in text or "use a" in text) and first_icon:
@@ -257,6 +274,14 @@ def _apply_time_anchor(
         elif patch.op == FixOp.remove_zoom:
             lo, hi = resolve_span(tokens[-1], words, plan.segments, span_s)
             patch.from_word, patch.to_word = lo, hi
+        elif patch.op == FixOp.resize_visual:
+            v = _find_resize_target(plan, patch)
+            scale = parse_scale(instruction, current=v.scale if v else 1.0)
+            if scale is not None:
+                patch.scale = scale
+            if tokens and patch.from_word is None:
+                lo, hi = resolve_span(tokens[-1], words, plan.segments, span_s)
+                patch.from_word, patch.to_word = lo, hi
     except AnchorError:
         pass
     return patch
@@ -285,17 +310,36 @@ def parse_fix(
     prompt = _build_prompt(instruction, plan, transcript, shots)
     client = make_client(cfg)
     last: Exception | None = None
+    patch: FixPatch | None = None
     for attempt in range(1, cfg.retry.llm_attempts + 1):
         try:
             raw = generate_json(client, cfg, cfg.models.visuals, prompt, FixPatch)
             patch = FixPatch.model_validate_json(_strip_fences(raw))
-            return _apply_time_anchor(
-                patch, instruction, plan, transcript, cfg.visuals.placement_span_s
-            )
+            break
         except Exception as exc:  # noqa: BLE001 — bounded retries then FixError
             last = exc
             time.sleep(cfg.retry.llm_backoff_s * attempt)
-    raise FixError(f"could not parse the correction: {last}")
+    if patch is None:
+        raise FixError(f"could not parse the correction: {last}")
+    return _apply_time_anchor(
+        patch, instruction, plan, transcript, cfg.visuals.placement_span_s
+    )
+
+
+def _find_resize_target(plan: EditPlan, patch: FixPatch):
+    """Visual for resize_visual: explicit id wins, else the visual covering
+    the named word (narrowest span wins ties). Returns None when unresolvable
+    so the anchor step can still fall back to a default scale base."""
+    if patch.visual_id:
+        try:
+            return _find_visual(plan, patch)
+        except FixError:
+            pass
+    if patch.from_word is not None:
+        cands = [v for v in plan.visuals if v.from_word <= patch.from_word <= v.to_word]
+        if cands:
+            return min(cands, key=lambda v: (v.to_word - v.from_word, v.from_word))
+    return None
 
 
 def _find_visual(plan: EditPlan, patch: FixPatch):
@@ -582,6 +626,19 @@ def apply_patch(
             raise FixError(f"no zoom near words {lo}..{hi}")
         plan.zoom_at_words = [z for z in plan.zoom_at_words if z not in inside]
         notes.append(f"fix: remove_zoom dropped zoom(s) at {inside}")
+
+    elif patch.op == FixOp.resize_visual:
+        v = _find_resize_target(plan, patch)
+        if v is None:
+            raise FixError(
+                "say which visual to resize (e.g. 'make the image at 0:58 smaller')"
+            )
+        if patch.scale is None:
+            raise FixError(
+                "say how small (e.g. 'make it 60%', 'halve it', 'make it small')"
+            )
+        old, v.scale = v.scale, patch.scale
+        notes.append(f"fix: resize_visual {v.id} scale {old:.2f} -> {v.scale:.2f}")
 
     try:
         validated = EditPlan.model_validate(plan.model_dump())

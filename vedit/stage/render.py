@@ -135,18 +135,28 @@ def _overlays_for_segment(
 
         is_shot = v.kind == "screenshot"
         cover = is_shot and cfg.visuals.screenshot_mode == "cover"
-        if cover:
+        full_cover = cover and v.scale >= 1.0
+        if full_cover:
             aw, ah = cfg.video.width, cfg.video.height
             x, y = 0, 0
+        elif cover:
+            # zoomed-out cover: fraction of the frame, resolution-independent
+            w0 = max(2, int(cfg.video.width * v.scale) // 2 * 2)
+            h0 = max(2, int(cfg.video.height * v.scale) // 2 * 2)
+            aw, ah = w0 + 12, h0 + 12
+            x, y = _place(v.pos, aw, ah, cfg)
+            x = min(max(x, 0), cfg.video.width - aw)
+            y = min(max(y, 0), cfg.video.height - ah)
         elif is_shot:
             iw, ih = _image_size(rv.asset)
             target_w = int(cfg.video.width * cfg.visuals.screenshot_width_frac)
-            target_w -= target_w % 2
+            target_w = max(2, int(target_w * v.scale) // 2 * 2)
             target_h = max(2, int(ih * (target_w / iw)))
             aw, ah = target_w + 12, target_h + 12  # + border pad
         else:
             iw, ih = _image_size(rv.asset)
-            aw, ah = iw, ih
+            aw = max(2, int(iw * v.scale))
+            ah = max(2, int(ih * v.scale))
 
         if not cover:
             x, y = _place(v.pos, aw, ah, cfg)
@@ -163,9 +173,9 @@ def _overlays_for_segment(
         in_dur = local_end - local_start
         fin = 0.0 if vis_start < seg_start + 1e-3 else min(fade, in_dur * 0.4)
         fout = 0.0 if vis_end > seg_end - 1e-3 else min(fade, in_dur * 0.4)
-        fx = fx_list[idx % len(fx_list)] if cover else "fade"
+        fx = fx_list[idx % len(fx_list)] if full_cover else "fade"
 
-        if cover:
+        if full_cover:
             w, h = cfg.video.width, cfg.video.height
         else:
             w, h = aw - (12 if is_shot else 0), ah - (12 if is_shot else 0)

@@ -96,6 +96,9 @@ async function handleUpdate(update, env) {
 
   // 1) reply context: a state ref becomes a hint for the talker, not a dispatch.
   // Legacy path (no GROQ_API_KEY): reply-to + text dispatches kind=fix directly.
+  // A reply to a bot message with pending confirm routes to the talker too
+  // (previews carry a state ref, but the user often just answers "this one").
+  const pending = await getPendingConfirm(env, chatId); // null-clears when stale
   let replyRef = null;
   const reply = msg.reply_to_message;
   if (reply) {
@@ -122,16 +125,18 @@ async function handleUpdate(update, env) {
       }
       replyRef = stateRef[0];
     } else if (reply.from?.is_bot) {
-      await sendText(
-        env,
-        chatId,
-        "that message has no state ref — just tell me which video and what to change",
-      );
-      return;
+      if (pending) {
+        replyRef = pending.state_ref;
+      } else {
+        await sendText(
+          env,
+          chatId,
+          "that message has no state ref — just tell me which video and what to change",
+        );
+        return;
+      }
     }
   }
-
-  const pending = await getPendingConfirm(env, chatId); // null-clears when stale
 
   // 2) staging commands (plain text only — never a reply/caption/media).
   // A pending confirm reroutes `done`-words to the talker (likely "confirm").
@@ -569,7 +574,7 @@ async function askTalker(env, ctx) {
       pending: ctx.pending,
       last_state: ctx.lastState,
       reply_ref: ctx.replyRef,
-    }) +    "\n\nYou CAN ask the pipeline to: cut/keep spans, place/move/remove images, " +
+    }) +    "\n\nYou CAN ask the pipeline to: cut/keep spans, place/move/remove/resize images, " +
     "recaption, add/remove zooms, replace icons. Times the user gives mean the " +
     "ORIGINAL uploaded video; the pipeline shows both clocks at confirm time — " +
     "never convert or second-guess times.\n" +
@@ -587,6 +592,8 @@ async function askTalker(env, ctx) {
     "- no: user rejects or cancels. reply = short ack.\n" +
     "- adjust: user tweaks the pending edit ('make it 0:40 instead'). instruction = the REVISED full edit. reply = short ack.\n" +
     "- Multiple edits in one message: instruction = the FIRST edit only; reply names it and promises the rest next.\n" +
+    "- Pending exists: affirmations (yes/yess/yeah/yup/do it/go/confirm/ok/okay/done/this one/do this) are YES, always — never chat. Rejections are NO. Status questions ('is it done?', 'are you working on it') get reassurance with a time expectation, never 'which video?'.\n" +
+    "- YES acks must set a time expectation ('Applying now — new cut lands here in a few minutes.') and never claim instant completion. A just-confirmed edit in conversation history answers later status questions the same way.\n" +
     "- Fix requested but no state ref exists anywhere: action chat, reply asks which video.\n" +
     "- Pending exists but the message is unrelated chit-chat: action chat, leave pending alone.";
   const messages = [

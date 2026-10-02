@@ -5,6 +5,7 @@ import pytest
 from vedit.schema import Segment, Word
 from vedit.stage.anchor import (
     AnchorError,
+    parse_scale,
     parse_time_tokens,
     resolve_point,
     resolve_span,
@@ -99,3 +100,18 @@ def test_resolve_point_clamps():
 def test_resolve_point_empty_raises():
     with pytest.raises(AnchorError):
         resolve_point(1.0, [], _segments())
+
+
+def test_parse_scale_forms():
+    assert parse_scale("shrink it to 60%") == 0.6
+    assert parse_scale("make it 150%") == 1.0
+    assert parse_scale("make it 5%") == 0.2
+    assert parse_scale("make it 0.6 size") == 0.6
+    assert parse_scale("halve it") == 0.5
+    assert parse_scale("make it tiny") == 0.35
+    assert parse_scale("make it full screen") == 1.0
+    assert parse_scale("make it smaller", current=1.0) == 0.7
+    assert parse_scale("make it bigger", current=0.5) == 0.65
+    assert parse_scale("make it bigger", current=1.0) == 1.0
+    assert parse_scale("place it at 0:30") is None
+    assert parse_scale("do something") is None

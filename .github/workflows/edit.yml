@@ -154,6 +154,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ inputs.chat_id }}
+          STATE_REF: ${{ inputs.state_ref }}
         run: |
           python - <<'PY'
           import json
@@ -167,9 +168,13 @@ jobs:
           chat = os.environ["CHAT_ID"]
           base = f"https://api.telegram.org/bot{token}"
           preview = json.loads(pathlib.Path("out/run/fix_preview.json").read_text())
+          # state ref trailers every confirmation so replying to it resolves
+          # the run even after the pending-confirm window expires.
+          text = confirmation_text(preview)[:3900]
+          text += f"\nstate {os.environ['STATE_REF']}"
           httpx.post(
               base + "/sendMessage",
-              json={"chat_id": chat, "text": confirmation_text(preview)[:4000]},
+              json={"chat_id": chat, "text": text},
               timeout=60,
           )
           frame = preview.get("frame")

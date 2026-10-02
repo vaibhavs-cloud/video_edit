@@ -251,3 +251,46 @@ def test_burn_captions_overwrites_existing_final(tmp_path, cfg):
     render.burn_captions(second_concat, tmp_path, tmp_path / "fonts", out, cfg)
     assert out.read_bytes() != first_bytes
     assert ff.duration_of(ff.probe(out)) == pytest.approx(1.0, abs=0.3)
+
+
+def test_scaled_cover_centers_inside_frame(tmp_path, cfg, transcript):
+    """resize_visual scale shrinks a cover to a centered, in-frame box."""
+    v = Visual(
+        id="v1",
+        kind="screenshot",
+        file="img.png",
+        from_word=10,
+        to_word=19,
+        pos="top-right",
+        scale=0.5,
+    )
+    asset = _shot(tmp_path)
+    resolved = [ResolvedVisual(visual=v, asset=asset)]
+    seg = (0.0, transcript.words[19].e + 1.0)
+    plans = render._overlays_for_segment(
+        seg[0], seg[1], resolved, transcript_plan(transcript), cfg
+    )
+    assert len(plans) == 1
+    p = plans[0]
+    assert (p.w, p.h) == (540, 960)
+    assert (p.x, p.y) == (1080 - 540 - 12 - 48, 300)
+    assert 0 <= p.x and p.x + p.w + 12 <= 1080
+    assert 0 <= p.y and p.y + p.h + 12 <= 1920
+
+
+def test_full_cover_unchanged(tmp_path, cfg, transcript):
+    v = Visual(
+        id="v1",
+        kind="screenshot",
+        file="img.png",
+        from_word=10,
+        to_word=19,
+        scale=1.0,
+    )
+    asset = _shot(tmp_path)
+    resolved = [ResolvedVisual(visual=v, asset=asset)]
+    seg = (0.0, transcript.words[19].e + 1.0)
+    plans = render._overlays_for_segment(
+        seg[0], seg[1], resolved, transcript_plan(transcript), cfg
+    )
+    assert [(p.x, p.y, p.w, p.h) for p in plans] == [(0, 0, 1080, 1920)]

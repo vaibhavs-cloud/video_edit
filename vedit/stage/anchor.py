@@ -17,6 +17,17 @@ _MMSS = re.compile(r"(?<!\d)(\d+):(\d{1,2}(?:\.\d+)?)(?!\d)")
 _NSEC = re.compile(
     r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b", re.IGNORECASE
 )
+_PCT = re.compile(r"(?<!\d)(\d+(?:\.\d+)?)\s*%")
+_FRAC = re.compile(r"(?<!\d)(0\.\d+)")
+_WORD_SCALE = {
+    "tiny": 0.35,
+    "small": 0.5,
+    "half": 0.5,
+    "halve": 0.5,
+    "full": 1.0,
+    "fullscreen": 1.0,
+    "original": 1.0,
+}
 
 
 class AnchorError(RuntimeError):
@@ -141,3 +152,27 @@ def resolve_span(
         while hi + 1 < n and words[hi + 1].s - words[lo].s < span_s:
             hi += 1
     return lo, min(hi, n - 1)
+
+
+def parse_scale(text: str, current: float = 1.0) -> float | None:
+    """Explicit size in a resize instruction, as a fraction of natural size.
+
+    Understands ``60%``, ``0.6``, and words (half/tiny/small/full, plus
+    relative smaller/bigger against ``current``). Clamped to [0.2, 1.0];
+    None when no size is named.
+    """
+    lowered = f" {(text or '')} ".lower()
+    m = _PCT.search(lowered)
+    if m:
+        return round(max(0.2, min(1.0, float(m.group(1)) / 100.0)), 2)
+    m = _FRAC.search(lowered)
+    if m:
+        return round(max(0.2, min(1.0, float(m.group(1)))), 2)
+    for word, value in _WORD_SCALE.items():
+        if f" {word} " in lowered or f" {word}s " in lowered:
+            return value
+    if " smaller " in lowered:
+        return round(max(0.2, current * 0.7), 2)
+    if " bigger " in lowered or " larger " in lowered:
+        return round(min(1.0, current * 1.3), 2)
+    return None

@@ -301,7 +301,16 @@ async function chatTurn(env, chatId, { text, replyRef, pending }) {
     lastState,
     replyRef,
   });
-  await pushConv(env, chatId, text, talk.reply);
+  await pushConv(env, chatId, text, talk.reply || "(no reply text)");
+  // Never go silent: an empty model reply still gets a human ack.
+  if (!talk.reply) {
+    talk.reply =
+      talk.action === "fix" || talk.action === "adjust"
+        ? "On it — previewing that now, one sec."
+        : talk.action === "yes"
+          ? "Applying now."
+          : "Got it.";
+  }
   if (talk.reply) await sendText(env, chatId, talk.reply);
 
   if (talk.action === "fix" || talk.action === "adjust") {

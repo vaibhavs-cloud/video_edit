@@ -1,7 +1,7 @@
 // Telegram -> GitHub Actions relay with a GPT-style talker (no structured input needed).
 //
 // POST /tg/<TELEGRAM_SECRET_PATH>  (+ X-Telegram-Bot-Api-Secret-Token check)
-//   free text (anything, reply or not) -> talker (Groq 8b-instant) decides:
+//   free text (anything, reply or not) -> talker (Groq gpt-oss-20b) decides:
 //     chat   -> direct reply, no pipeline run
 //     fix    -> dispatch kind=fix-dryrun, preview posted by the workflow,
 //               pending confirm stored in KV; YES -> kind=fix-apply
@@ -32,7 +32,7 @@
 
 const GITHUB_API = "https://api.github.com";
 const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
-const CHAT_MODEL = "llama-3.1-8b-instant";
+const CHAT_MODEL = "openai/gpt-oss-20b";
 const TG_MAX_VIDEO_BYTES = 20 * 1024 * 1024;
 const DONE_WORDS = new Set(["done", "go", "process", "process it", "start", "confirm"]);
 const CANCEL_WORDS = new Set(["cancel", "clear", "reset"]);
@@ -532,7 +532,7 @@ function extractJson(text) {
   }
 }
 
-// One small-model call per message (llama-3.1-8b-instant: fast, near-free).
+// One small-model call per message (openai/gpt-oss-20b: fast, near-free).
 // Edit decisions NEVER happen here — the talker only classifies + rephrases;
 // the pipeline (dry-run preview -> explicit YES -> apply) decides.
 async function askTalker(env, ctx) {

@@ -216,3 +216,38 @@ def test_segment_fingerprint_stable_and_sensitive(tmp_path, cfg):
     assert render._segment_fingerprint(0.0, 2.5, [], True, base, clean, cfg) != fp1
     assert render._segment_fingerprint(0.0, 3.0, [], False, base, clean, cfg) != fp1
     assert asset.exists()
+
+
+def _ass_text(text: str) -> str:
+    return (
+        "[Script Info]\nScriptType: v4.00+\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
+        "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
+        "MarginL, MarginR, MarginV, Encoding\n"
+        "Style: Cap,Arial,20,&H00FFFFFF,&H00FFFFFF,&H00000000,&H7F000000,"
+        "0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+        "Effect, Text\n"
+        f"Dialogue: 0,0:00:00.00,0:00:01.00,Cap,,0,0,0,,{text}\n"
+    )
+
+
+def test_burn_captions_overwrites_existing_final(tmp_path, cfg):
+    """Regression: every fix re-render must replace final.mp4 (was kept stale)."""
+    from vedit import ff
+
+    out = tmp_path / "final.mp4"
+    first_concat = _synthetic_segment(tmp_path / "concat.mp4", 2.0, 440)
+    (tmp_path / "captions.ass").write_text(_ass_text("first"), encoding="utf-8")
+    render.burn_captions(first_concat, tmp_path, tmp_path / "fonts", out, cfg)
+    first_bytes = out.read_bytes()
+    assert ff.duration_of(ff.probe(out)) == pytest.approx(2.0, abs=0.3)
+
+    second_concat = _synthetic_segment(tmp_path / "concat2.mp4", 1.0, 660)
+    (tmp_path / "captions.ass").write_text(_ass_text("second"), encoding="utf-8")
+    render.burn_captions(second_concat, tmp_path, tmp_path / "fonts", out, cfg)
+    assert out.read_bytes() != first_bytes
+    assert ff.duration_of(ff.probe(out)) == pytest.approx(1.0, abs=0.3)

@@ -1,29 +1,45 @@
-// Telegram -> GitHub Actions relay (batch mode: nothing runs until `done`).
+// Telegram -> GitHub Actions relay with a GPT-style talker (no structured input needed).
 //
 // POST /tg/<TELEGRAM_SECRET_PATH>  (+ X-Telegram-Bot-Api-Secret-Token check)
-//   reply to a delivered video with text  -> dispatch kind=fix (state_ref + instruction)
+//   free text (anything, reply or not) -> talker (Groq 8b-instant) decides:
+//     chat   -> direct reply, no pipeline run
+//     fix    -> dispatch kind=fix-dryrun, preview posted by the workflow,
+//               pending confirm stored in KV; YES -> kind=fix-apply
 //   `done` (or go/process)                -> dispatch staged video/link + images
-//   `cancel`                              -> clear staging, dispatch nothing
+//   `cancel`                              -> clear staging (+ pending confirm), dispatch nothing
 //   text containing a URL                 -> stage the link, wait for `done`
 //   photo / image file                   -> stage it (caption = label + time), wait
 //   video attachment <= 20 MB             -> stage it, wait for `done`
 //   video attachment > 20 MB              -> reply asking for a Drive link
-//   anything else                         -> usage help
 // GET /health -> 200
 //
+// Talk policy lives here at the edge (fast, ~1 cheap LLM call per message);
+// ALL edit decisions stay in-repo (parse -> dry-run preview -> apply-preview).
 // Staging lives in KV (1h TTL): pending_video:<chat> + pending:<chat>.
+// Dialogue memory: conv:<chat> (last 6 turns, 1h TTL).
+// Pending confirm: pending_confirm:<chat> {state_ref, instruction, ts} (30 min).
+// Last delivered video is resolved on demand via the GitHub artifacts API
+// (latest state-<sha8>), so free text never needs a reply-to message.
 // Image captions carry label + placement, e.g. `pyramid at 0:20`,
 // `diagram 0:45-0:50`, `chart @1m20s` — any timestamp formatting works,
 // the planner maps times to words and falls back to best-fit.
 //
 // Secrets (Cloudflare secret_text): TELEGRAM_BOT_TOKEN, TELEGRAM_SECRET_PATH,
-// TELEGRAM_SECRET_TOKEN, GH_TOKEN, ALLOWED_CHAT_ID.
+// TELEGRAM_SECRET_TOKEN, GH_TOKEN, ALLOWED_CHAT_ID, GROQ_API_KEY.
+// Without GROQ_API_KEY the bot falls back to legacy behavior (reply-to fix
+// dispatches immediately, anything else gets usage help).
 // Bindings: PENDING_IMAGES (KV namespace "vedit-pending-images").
 
 const GITHUB_API = "https://api.github.com";
+const GROQ_URL = "https://api.groq.com/openai/v1/chat/completions";
+const CHAT_MODEL = "llama-3.1-8b-instant";
 const TG_MAX_VIDEO_BYTES = 20 * 1024 * 1024;
 const DONE_WORDS = new Set(["done", "go", "process", "process it", "start", "confirm"]);
 const CANCEL_WORDS = new Set(["cancel", "clear", "reset"]);
+const CONV_TTL = 3600;
+const CONFIRM_TTL = 1800;
+const CONFIRM_STALE_MS = 30 * 60 * 1000;
+const CONV_TURNS = 6;
 
 export default {
   async fetch(request, env) {
@@ -76,46 +92,65 @@ async function handleUpdate(update, env) {
   }
 
   const text = (msg.text || msg.caption || "").trim();
+  const hasMedia = Boolean(msg.video || msg.photo || msg.document);
 
-  // 1) reply to a delivered message that carries a state ref -> correction
+  // 1) reply context: a state ref becomes a hint for the talker, not a dispatch.
+  // Legacy path (no GROQ_API_KEY): reply-to + text dispatches kind=fix directly.
+  let replyRef = null;
   const reply = msg.reply_to_message;
   if (reply) {
-    const replied = String(reply.text || reply.caption || "");
-    const stateRef = replied.match(/\b[0-9a-f]{8}\b/);
+    const stateRef = String(reply.text || reply.caption || "").match(/\b[0-9a-f]{8}\b/);
     if (stateRef) {
       if (!text) {
         await sendText(
           env,
           chatId,
-          'send the correction as a reply, e.g. "place image 1 at 0:20"',
+          'send the correction as text, e.g. "place image 1 at 0:20"',
         );
         return;
       }
-      await dispatch(env, {
-        kind: "fix",
-        chat_id: chatId,
-        state_ref: stateRef[0],
-        instruction: text,
-        attachments: JSON.stringify(await takePending(env, chatId)),
-      });
-      await sendText(env, chatId, `queued fix ${stateRef[0]} — new cut coming`);
-      return;
-    }
-    if (reply.from?.is_bot) {
+      if (!env.GROQ_API_KEY) {
+        await dispatch(env, {
+          kind: "fix",
+          chat_id: chatId,
+          state_ref: stateRef[0],
+          instruction: text,
+          attachments: JSON.stringify(await takePending(env, chatId)),
+        });
+        await sendText(env, chatId, `queued fix ${stateRef[0]} — new cut coming`);
+        return;
+      }
+      replyRef = stateRef[0];
+    } else if (reply.from?.is_bot) {
       await sendText(
         env,
         chatId,
-        "that message has no state ref — reply to a delivered video (its caption ends with `state xxxxxxxx`)",
+        "that message has no state ref — just tell me which video and what to change",
       );
       return;
     }
   }
 
-  // 2) staging commands (plain text only — never a reply/caption/media)
-  const hasMedia = Boolean(msg.video || msg.photo || msg.document);
+  const pending = await getPendingConfirm(env, chatId); // null-clears when stale
+
+  // 2) staging commands (plain text only — never a reply/caption/media).
+  // A pending confirm reroutes `done`-words to the talker (likely "confirm").
   const cmd = text.toLowerCase();
   if (!reply && !hasMedia) {
-    if (DONE_WORDS.has(cmd)) {
+    if (CANCEL_WORDS.has(cmd)) {
+      await clearPendingConfirm(env, chatId);
+      await takePending(env, chatId);
+      await clearVideo(env, chatId);
+      await sendText(
+        env,
+        chatId,
+        pending
+          ? "scrapped — staging empty and the pending edit is cancelled."
+          : "cleared — staging empty. Send a video when ready.",
+      );
+      return;
+    }
+    if (DONE_WORDS.has(cmd) && !pending) {
       const video = await getVideo(env, chatId);
       if (!video) {
         const staged = await getPending(env, chatId);
@@ -146,12 +181,6 @@ async function handleUpdate(update, env) {
           ? `queued — building v1 from your video + ${imgs.length} image(s)`
           : "queued — processing your video now",
       );
-      return;
-    }
-    if (CANCEL_WORDS.has(cmd)) {
-      await takePending(env, chatId);
-      await clearVideo(env, chatId);
-      await sendText(env, chatId, "cleared — staging empty. Send a video when ready.");
       return;
     }
   }
@@ -236,14 +265,89 @@ async function handleUpdate(update, env) {
     return;
   }
 
-  // 6) anything else -> usage
-  await sendText(
-    env,
-    chatId,
-    "send a video or link (it waits here), then images with captions " +
-      "(`pyramid at 0:20`), then `done` — v1 builds once, with everything placed. " +
-      "Reply to a delivered video to correct it; `cancel` clears staging.",
-  );
+  // 6) free text -> GPT-style talker turn (no structured input needed).
+  // Legacy path (no GROQ_API_KEY): usage help.
+  if (!env.GROQ_API_KEY) {
+    await sendText(
+      env,
+      chatId,
+      "send a video or link (it waits here), then images with captions " +
+        "(`pyramid at 0:20`), then `done` — v1 builds once, with everything placed. " +
+        "Reply to a delivered video to correct it; `cancel` clears staging.",
+    );
+    return;
+  }
+  await chatTurn(env, chatId, { text, replyRef, pending });
+}
+
+// One conversational turn: talker decides chat / fix / yes / no / adjust.
+// Edit decisions always go through dry-run preview + explicit YES.
+async function chatTurn(env, chatId, { text, replyRef, pending }) {
+  const turns = await getConv(env, chatId);
+  const staged = await getPending(env, chatId);
+  const video = await getVideo(env, chatId);
+  let lastState = replyRef || pending?.state_ref || null;
+  if (!lastState) lastState = await getLatestStateRef(env);
+  const talk = await askTalker(env, {
+    text,
+    turns,
+    staged: { images: staged.length, video: Boolean(video) },
+    pending: pending ? { op: pending.op, instruction: pending.instruction } : null,
+    lastState,
+    replyRef,
+  });
+  await pushConv(env, chatId, text, talk.reply);
+  if (talk.reply) await sendText(env, chatId, talk.reply);
+
+  if (talk.action === "fix" || talk.action === "adjust") {
+    const ref = talk.state_ref || replyRef || pending?.state_ref || lastState;
+    const instruction = talk.instruction || text;
+    if (!ref) {
+      await sendText(
+        env,
+        chatId,
+        "which video should I change? Reply to a delivered video and tell me the edit.",
+      );
+      return;
+    }
+    await setPendingConfirm(env, chatId, {
+      state_ref: ref,
+      instruction,
+      op: talk.action,
+      ts: Date.now(),
+    });
+    await dispatch(env, {
+      kind: "fix-dryrun",
+      chat_id: chatId,
+      state_ref: ref,
+      instruction,
+      attachments: JSON.stringify(await takePending(env, chatId)),
+    });
+    return;
+  }
+  if (talk.action === "yes") {
+    if (!pending) {
+      await sendText(
+        env,
+        chatId,
+        "nothing waiting for approval — tell me an edit and I'll preview it first.",
+      );
+      return;
+    }
+    await clearPendingConfirm(env, chatId);
+    await dispatch(env, {
+      kind: "fix-apply",
+      chat_id: chatId,
+      state_ref: pending.state_ref,
+      instruction: "",
+    });
+    return;
+  }
+  if (talk.action === "no") {
+    if (pending) await clearPendingConfirm(env, chatId);
+    return; // ack already sent as the reply
+  }
+  // chat / unknown: reply already sent, nothing to dispatch.
 }
 
 // Staged input images, buffered in KV between messages (1h TTL).
@@ -319,6 +423,187 @@ async function clearVideo(env, chatId) {
     } catch {
       // staging is best-effort; the TTL cleans up regardless
     }
+  }
+}
+
+// ---- GPT-style talk: dialogue memory, pending confirms, state lookup ----
+
+function convKey(chatId) {
+  return `conv:${chatId}`;
+}
+
+function confirmKey(chatId) {
+  return `pending_confirm:${chatId}`;
+}
+
+async function getConv(env, chatId) {
+  try {
+    if (!env.PENDING_IMAGES) return [];
+    const list = JSON.parse((await env.PENDING_IMAGES.get(convKey(chatId))) || "[]");
+    return Array.isArray(list) ? list.filter((t) => t && t.r && t.t).slice(-CONV_TURNS) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function pushConv(env, chatId, userText, assistantText) {
+  try {
+    if (!env.PENDING_IMAGES) return;
+    const turns = await getConv(env, chatId);
+    turns.push({ r: "u", t: String(userText || "").slice(0, 500) });
+    if (assistantText) turns.push({ r: "a", t: String(assistantText).slice(0, 500) });
+    await env.PENDING_IMAGES.put(convKey(chatId), JSON.stringify(turns.slice(-CONV_TURNS)), {
+      expirationTtl: CONV_TTL,
+    });
+  } catch {
+    // memory is best-effort; never break the turn
+  }
+}
+
+async function getPendingConfirm(env, chatId) {
+  try {
+    if (!env.PENDING_IMAGES) return null;
+    const raw = await env.PENDING_IMAGES.get(confirmKey(chatId));
+    if (!raw) return null;
+    const p = JSON.parse(raw);
+    if (!p || !p.state_ref || Date.now() - (p.ts || 0) > CONFIRM_STALE_MS) {
+      await env.PENDING_IMAGES.delete(confirmKey(chatId));
+      return null;
+    }
+    return p;
+  } catch {
+    return null;
+  }
+}
+
+async function setPendingConfirm(env, chatId, pending) {
+  try {
+    if (!env.PENDING_IMAGES) return;
+    await env.PENDING_IMAGES.put(confirmKey(chatId), JSON.stringify(pending), {
+      expirationTtl: CONFIRM_TTL,
+    });
+  } catch {
+    // best-effort; apply-preview still guards on plan hash
+  }
+}
+
+async function clearPendingConfirm(env, chatId) {
+  try {
+    if (env.PENDING_IMAGES) await env.PENDING_IMAGES.delete(confirmKey(chatId));
+  } catch {
+    // best-effort
+  }
+}
+
+// Newest delivered state, so free text never needs a reply-to message.
+async function getLatestStateRef(env) {
+  try {
+    const resp = await fetch(
+      `${GITHUB_API}/repos/${env.GH_OWNER}/${env.GH_REPO}/actions/artifacts?per_page=20`,
+      {
+        headers: {
+          Authorization: `Bearer ${env.GH_TOKEN}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "vedit-relay",
+        },
+      },
+    );
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const arts = Array.isArray(data?.artifacts) ? data.artifacts : [];
+    const states = arts
+      .filter((a) => /^state-[0-9a-f]{8}$/.test(a?.name || ""))
+      .sort((a, b) => String(b.created_at || "").localeCompare(String(a.created_at || "")));
+    const m = states.length ? states[0].name.match(/^state-([0-9a-f]{8})$/) : null;
+    return m ? m[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractJson(text) {
+  try {
+    const start = String(text || "").indexOf("{");
+    const end = String(text || "").lastIndexOf("}");
+    if (start < 0 || end <= start) return null;
+    return JSON.parse(String(text).slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+// One small-model call per message (llama-3.1-8b-instant: fast, near-free).
+// Edit decisions NEVER happen here — the talker only classifies + rephrases;
+// the pipeline (dry-run preview -> explicit YES -> apply) decides.
+async function askTalker(env, ctx) {
+  const system =
+    "You are Vedit, the owner's personal video editor, chatting on Telegram. " +
+    "Warm, brief, human — like texting a real editor. Keep replies to 1-2 short " +
+    "sentences unless explaining. Never mention models, prompts, word indices, or internals.\n\n" +
+    "CONTEXT (JSON): " +
+    JSON.stringify({
+      staged: ctx.staged,
+      pending: ctx.pending,
+      last_state: ctx.lastState,
+      reply_ref: ctx.replyRef,
+    }) +    "\n\nYou CAN ask the pipeline to: cut/keep spans, place/move/remove images, " +
+    "recaption, add/remove zooms, replace icons. Times the user gives mean the " +
+    "ORIGINAL uploaded video; the pipeline shows both clocks at confirm time — " +
+    "never convert or second-guess times.\n" +
+    "You CANNOT: music, effects, new footage, speed changes, caption styling. " +
+    "Say so plainly and offer the closest alternative.\n\n" +
+    "Decide ONE action, reply with raw JSON only:\n" +
+    '{"action": "chat|fix|yes|no|adjust", ' +
+    '"reply": "<message to send the owner NOW>", ' +
+    '"instruction": "<self-contained edit text for fix/adjust>", ' +
+    '"state_ref": "<8hex ref the edit targets, echo from context>"}\n' +
+    "- chat: small talk, questions, help, status, anything needing no pipeline. Full answer in reply.\n" +
+    "- fix: a concrete edit. reply = short ack like 'On it — previewing that cut, one sec.' " +
+    "instruction = the complete edit. state_ref = reply_ref, pending ref, or last_state.\n" +
+    "- yes: user confirms the pending edit (yes/yeah/do it/confirm/done...). reply = short ack.\n" +
+    "- no: user rejects or cancels. reply = short ack.\n" +
+    "- adjust: user tweaks the pending edit ('make it 0:40 instead'). instruction = the REVISED full edit. reply = short ack.\n" +
+    "- Fix requested but no state ref exists anywhere: action chat, reply asks which video.\n" +
+    "- Pending exists but the message is unrelated chit-chat: action chat, leave pending alone.";
+  try {
+    const resp = await fetch(GROQ_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.GROQ_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: CHAT_MODEL,
+        temperature: 0.4,
+        max_tokens: 400,
+        messages: [
+          { role: "system", content: system },
+          ...ctx.turns.map((t) => ({
+            role: t.r === "a" ? "assistant" : "user",
+            content: t.t,
+          })),
+          { role: "user", content: ctx.text },
+        ],
+      }),
+    });
+    if (!resp.ok) throw new Error(`groq ${resp.status}`);
+    const data = await resp.json();
+    const content = data?.choices?.[0]?.message?.content || "";
+    const parsed = extractJson(content);
+    if (parsed && typeof parsed.action === "string") {
+      return {
+        action: parsed.action,
+        reply: String(parsed.reply || "").slice(0, 1000),
+        instruction: String(parsed.instruction || ""),
+        state_ref: String(parsed.state_ref || ""),
+      };
+    }
+    return { action: "chat", reply: content.slice(0, 1000) || "noted." };
+  } catch {
+    return {
+      action: "chat",
+      reply: "hmm, my brain hiccuped — say that again?",
+    };
   }
 }
 

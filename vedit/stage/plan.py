@@ -19,6 +19,7 @@ from vedit.llm import generate_json, make_client, missing_key
 from vedit.schema import (
     CaptionSpan,
     DraftCaption,
+    DraftVisual,
     EditPlan,
     PlanDraft,
     Reframe,
@@ -26,6 +27,7 @@ from vedit.schema import (
     Transcript,
     Visual,
 )
+from vedit.stage.anchor import AnchorError, parse_time_tokens, resolve_span
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -80,7 +82,7 @@ DECIDE
 {visual_rules}
     - range [from_word, to_word] inclusive, must lie inside ONE kept segment
     - pos: where it sits; zoom: true only for a strong emphasis moment
-    - Owner-specified placements in the instruction (image name + time) win over everything: use exactly that file, mapped to the closest kept words at that time (times are source seconds; never straddle a cut gap — pick the nearest kept segment)
+    - Owner-specified placements in the instruction (image name + time) win over everything: use exactly that file, mapped to the closest kept words at that time (times are source seconds; never straddle a cut gap — pick the nearest kept segment). Deterministic code enforces owner placements after your draft; still emit your best mapping.
 2. captions — split the talk into readable spans of 1-6 words each.
    - every word of the transcript should be covered by exactly one span
    - each span must lie inside ONE kept segment (never cross a segment boundary)
@@ -181,6 +183,62 @@ def _clip_to_segment(a: int, b: int, seg: Segment) -> tuple[int, int] | None:
     return (lo, hi) if lo <= hi else None
 
 
+_OWNER_FILE = re.compile(r"[\w\-.]+?\.(?:png|jpg|jpeg|webp)", re.IGNORECASE)
+
+
+def _owner_placements(
+    draft: PlanDraft,
+    user_prompt: str,
+    transcript: Transcript,
+    segments: list[Segment],
+    cfg: Config,
+    source_dur: float,
+) -> list[str]:
+    """Deterministically enforce owner-specified image+time placements.
+
+    Repositions the draft screenshot visual whose file is named in the
+    instruction (nth file pairs with nth timestamp, else the first), and
+    appends an owner placement the model missed entirely. Mutates
+    draft.visuals in place; the normal validation loop below still applies.
+    No timestamps in the instruction means no enforcement.
+    """
+    notes: list[str] = []
+    prompt = user_prompt or ""
+    dur = source_dur if source_dur > 0 else float("inf")
+    times = parse_time_tokens(prompt, source_dur=dur)
+    if not times:
+        return notes
+    span_s = cfg.visuals.placement_span_s
+    candidates = list(dict.fromkeys(m.group(0) for m in _OWNER_FILE.finditer(prompt)))
+    for idx, fname in enumerate(candidates):
+        t = times[min(idx, len(times) - 1)]
+        try:
+            lo, hi = resolve_span(t, transcript.words, segments, span_s)
+        except AnchorError:
+            notes.append(f"owner placement '{fname}' @ input {t:.1f}s not anchorable")
+            continue
+        target = next(
+            (
+                dv
+                for dv in draft.visuals
+                if dv.kind == "screenshot" and dv.file == fname
+            ),
+            None,
+        )
+        if target is None:
+            draft.visuals.append(
+                DraftVisual(kind="screenshot", file=fname, from_word=lo, to_word=hi)
+            )
+            notes.append(
+                f"owner placement: '{fname}' @ input {t:.1f}s "
+                f"-> words {lo}..{hi} (added)"
+            )
+            continue
+        target.from_word, target.to_word = lo, hi
+        notes.append(f"owner placement: '{fname}' @ input {t:.1f}s -> words {lo}..{hi}")
+    return notes
+
+
 def assemble_plan(
     draft: PlanDraft,
     transcript: Transcript,
@@ -198,6 +256,16 @@ def assemble_plan(
     notes: list[str] = []
     if note:
         notes.append(note)
+    notes.extend(
+        _owner_placements(
+            draft,
+            user_prompt,
+            transcript,
+            segments,
+            cfg,
+            float(source_meta.get("dur", 0) or 0),
+        )
+    )
     n_words = len(transcript.words)
     visuals: list[Visual] = []
     counter = 0

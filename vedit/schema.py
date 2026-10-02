@@ -212,6 +212,10 @@ class FixOp(str, Enum):
     recaption = "recaption"
     retime_visual = "retime_visual"
     add_visual = "add_visual"
+    cut_range = "cut_range"
+    keep_range = "keep_range"
+    add_zoom = "add_zoom"
+    remove_zoom = "remove_zoom"
     unknown = "unknown"
 
 

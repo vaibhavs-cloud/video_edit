@@ -229,3 +229,50 @@ def test_fix_can_place_input_image(tmp_path):
     assert len(vague["visuals"]) == len(after["visuals"]) + 1
     assert vague["visuals"][-1]["file"] == "diagram.png"
     assert json.loads((state / "qc.json").read_text(encoding="utf-8"))["passed"] is True
+
+
+def test_fix_cut_and_confirm_flow(tmp_path):
+    assert main(_process(tmp_path, "cutflow")) == 0
+    state = tmp_path / "cutflow"
+    before = json.loads((state / "edit_plan.json").read_text(encoding="utf-8"))
+    kept_before = sum(s["end"] - s["start"] for s in before["segments"])
+
+    # direct cut re-times the plan and re-renders through QC
+    assert (
+        main(["fix", "--state", str(state), "--instruction", "cut 0:05 to 0:10", *CFG])
+        == 0
+    )
+    after = json.loads((state / "edit_plan.json").read_text(encoding="utf-8"))
+    kept_after = sum(s["end"] - s["start"] for s in after["segments"])
+    assert kept_after < kept_before
+    assert after["segments"], "at least one segment must survive"
+    assert json.loads((state / "qc.json").read_text(encoding="utf-8"))["passed"] is True
+
+    # dry-run zoom preview changes nothing but writes preview + tagged frame
+    plan_bytes = (state / "edit_plan.json").read_bytes()
+    assert (
+        main(
+            [
+                "fix",
+                "--state",
+                str(state),
+                "--instruction",
+                "zoom in at 0:15",
+                "--dry-run",
+                *CFG,
+            ]
+        )
+        == 0
+    )
+    preview = json.loads((state / "fix_preview.json").read_text(encoding="utf-8"))
+    assert preview["ok"] is True and preview["op"] == "add_zoom"
+    assert "input_range_s" in preview and "output_range_s" in preview
+    assert "frame" in preview
+    assert (state / preview["frame"]).exists()
+    assert (state / "edit_plan.json").read_bytes() == plan_bytes
+
+    # applying the preview lands the zoom and passes QC
+    assert main(["fix", "--state", str(state), "--apply-preview", *CFG]) == 0
+    final = json.loads((state / "edit_plan.json").read_text(encoding="utf-8"))
+    assert len(final["zoom_at_words"]) == len(after["zoom_at_words"]) + 1
+    assert json.loads((state / "qc.json").read_text(encoding="utf-8"))["passed"] is True

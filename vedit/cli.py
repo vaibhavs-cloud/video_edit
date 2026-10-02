@@ -19,7 +19,15 @@ from vedit import ff
 from vedit import state as st
 from vedit.acquire import acquire, verify_media
 from vedit.config import Config, load_config
-from vedit.schema import EditPlan, FixOp, PlanDraft, Segment, StateMeta, Transcript
+from vedit.schema import (
+    EditPlan,
+    FixOp,
+    FixPatch,
+    PlanDraft,
+    Segment,
+    StateMeta,
+    Transcript,
+)
 from vedit.stage import audio as audio_stage
 from vedit.stage import captions as captions_stage
 from vedit.stage import cuts, render, transcribe
@@ -557,9 +565,12 @@ def cmd_fix(args: argparse.Namespace) -> int:
     cfg = load_config(args.config)
     ff.require_tools()
     state = Path(args.state)
+    if not args.apply_preview and not (args.instruction or "").strip():
+        raise SystemExit("fix needs --instruction (or --apply-preview)")
     plan = st.load_model(state / "edit_plan.json", EditPlan)
     ctx = _ctx_from_state(state, cfg, plan.prompt, args.chat_id or "")
     transcript = _load_transcript(ctx)
+    zoom_cap = max(1, len(plan.segments) // ctx.cfg.video.max_zoom_segments_div)
     _log(f"[fix] {args.instruction}")
     shots = (
         sorted(p.name for p in ctx.attachments.iterdir() if p.is_file())
@@ -567,16 +578,60 @@ def cmd_fix(args: argparse.Namespace) -> int:
         else []
     )
 
-    try:
-        patch = fix_stage.parse_fix(
-            args.instruction, plan, transcript, cfg, mock=ctx.mock, screenshots=shots
+    if args.dry_run:
+        preview = fix_stage.preview_fix(
+            args.instruction,
+            plan,
+            transcript,
+            cfg,
+            mock=ctx.mock,
+            screenshots=shots,
+            icons_enabled=ctx.cfg.visuals.icons_enabled,
+            max_zooms=zoom_cap,
         )
+        frame: Path | None = None
+        if preview.get("ok") and "input_range_s" in preview:
+            existing = sorted((state / "preview").glob("fix_preview_*.jpg"))
+            out = state / "preview" / f"fix_preview_{len(existing) + 1}.jpg"
+            frame = fix_stage.preview_frame(
+                state / "source.mp4",
+                out,
+                preview["input_range_s"][0],
+                f"input {preview['input_range_s'][0]:.1f}s - {preview['op']}",
+                FONTS_DIR if FONTS_DIR.exists() else None,
+            )
+            if frame is not None:
+                preview["frame"] = frame.relative_to(state).as_posix()
+        st.save_json(state / "fix_preview.json", preview)
+        _log(f"[fix:preview] {fix_stage.confirmation_text(preview)}")
+        return 0 if preview.get("ok") else 2
+
+    try:
+        if args.apply_preview:
+            preview_file = state / "fix_preview.json"
+            if not preview_file.exists():
+                raise SystemExit("no fix_preview.json — run fix --dry-run first")
+            data = st.load_json(preview_file)
+            if data.get("plan_hash") != fix_stage.plan_hash(plan):
+                raise SystemExit("plan changed since preview — re-run fix --dry-run")
+            patch = FixPatch.model_validate(data["patch"])
+            _log(f"[fix] applying previewed {patch.op.value} (no re-parse)")
+        else:
+            patch = fix_stage.parse_fix(
+                args.instruction,
+                plan,
+                transcript,
+                cfg,
+                mock=ctx.mock,
+                screenshots=shots,
+            )
         new_plan, notes = fix_stage.apply_patch(
             patch,
             plan,
             transcript,
             icons_enabled=ctx.cfg.visuals.icons_enabled,
             screenshots=shots,
+            max_zooms=zoom_cap,
         )
     except fix_stage.FixError as exc:
         _log(f"[fix] {exc}")
@@ -585,6 +640,9 @@ def cmd_fix(args: argparse.Namespace) -> int:
         return 0  # handled: state untouched, run stays chainable
 
     st.save_model(state / "edit_plan.json", new_plan)
+    st.save_json(
+        state / "segments.json", [s.model_dump() for s in new_plan.segments]
+    )  # cut/keep fixes rewrite segments too
     notes_file = state / "notes.json"
     existing = st.load_json(notes_file) if notes_file.exists() else []
     st.save_json(notes_file, existing + notes)
@@ -676,7 +734,17 @@ def build_parser() -> argparse.ArgumentParser:
         "fix", help="apply a correction and re-render from the plan stage"
     )
     f.add_argument("--state", required=True)
-    f.add_argument("--instruction", required=True)
+    f.add_argument("--instruction", default="")
+    f.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="preview only: write state/fix_preview.json + tagged frame, change nothing",
+    )
+    f.add_argument(
+        "--apply-preview",
+        action="store_true",
+        help="apply state/fix_preview.json without re-parsing (refuses on plan drift)",
+    )
     f.add_argument("--config", default="config.yaml")
     f.add_argument("--chat-id", default="")
     f.set_defaults(func=cmd_fix)

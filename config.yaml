@@ -75,6 +75,7 @@ visuals:
   icon_size: 200
   fade_s: 0.25
   screenshot_width_frac: 0.9
+  placement_span_s: 2.5 # owner timestamp -> transcript phrase span ("place image 1 at 0:30")
 
 captions:
   font: Inter-SemiBold

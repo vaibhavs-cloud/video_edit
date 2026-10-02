@@ -4,6 +4,7 @@ import time
 
 from vedit.schema import DraftCaption, DraftVisual, PlanDraft
 from vedit.stage import plan as plan_stage
+from vedit.stage.anchor import parse_time_tokens, resolve_span
 from vedit.stage.plan import _fallback_draft, assemble_plan, draft_plan
 
 
@@ -195,3 +196,73 @@ def test_reversed_and_out_of_range_drafts_never_crash(
         c.from_word <= e <= c.to_word for c in built.captions for e in c.emphasis
     )
     assert all(0 <= z < len(transcript.words) for z in built.zoom_at_words)
+
+
+def _biggest_span(segments):
+    return max(segments, key=lambda s: s.keep_to_word - s.keep_from_word)
+
+
+def test_owner_placement_repositions_screenshot(cfg, transcript, segments, source_dur):
+    seg = _biggest_span(segments)
+    mid = (seg.keep_from_word + seg.keep_to_word) // 2
+    t = transcript.words[mid].s
+    draft = PlanDraft(
+        visuals=[
+            DraftVisual(kind="screenshot", file="diagram.png", from_word=0, to_word=1)
+        ],
+        captions=[],
+        zoom_at_words=[],
+    )
+    prompt = f"put diagram.png at {t:.1f} seconds"
+    built, notes = assemble_plan(
+        draft, transcript, segments, cfg, prompt, _meta(source_dur), False, ""
+    )
+    got = next(v for v in built.visuals if v.file == "diagram.png")
+    tokens = parse_time_tokens(prompt, source_dur=source_dur)
+    expected = resolve_span(
+        tokens[0], transcript.words, segments, cfg.visuals.placement_span_s
+    )
+    assert (got.from_word, got.to_word) == expected
+    assert (got.from_word, got.to_word) != (0, 1)
+    assert any("owner placement" in n for n in notes)
+
+
+def test_owner_placement_appends_missing_visual(cfg, transcript, segments, source_dur):
+    draft = PlanDraft(visuals=[], captions=[], zoom_at_words=[])
+    prompt = "place poster.png at 0:10"
+    built, notes = assemble_plan(
+        draft, transcript, segments, cfg, prompt, _meta(source_dur), False, ""
+    )
+    got = next(v for v in built.visuals if v.file == "poster.png")
+    tokens = parse_time_tokens(prompt, source_dur=source_dur)
+    expected = resolve_span(
+        tokens[0], transcript.words, segments, cfg.visuals.placement_span_s
+    )
+    assert (got.from_word, got.to_word) == expected
+    assert any("(added)" in n for n in notes)
+
+
+def test_plain_prompt_has_no_owner_enforcement(cfg, transcript, segments, source_dur):
+    seg = _biggest_span(segments)
+    lo = seg.keep_from_word
+    hi = min(lo + 2, seg.keep_to_word)
+    draft = PlanDraft(
+        visuals=[
+            DraftVisual(kind="screenshot", file="diagram.png", from_word=lo, to_word=hi)
+        ],
+        captions=[],
+        zoom_at_words=[],
+    )
+    built, notes = assemble_plan(
+        draft,
+        transcript,
+        segments,
+        cfg,
+        "put diagram.png near the start",
+        _meta(source_dur),
+        False,
+        "",
+    )
+    got = next(v for v in built.visuals if v.file == "diagram.png")
+    assert (got.from_word, got.to_word) == (lo, hi)
+    assert not any("owner placement" in n for n in notes)

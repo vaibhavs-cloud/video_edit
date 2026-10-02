@@ -126,10 +126,16 @@ def build_lines(plan: EditPlan, cfg: Config) -> list[CaptionLine]:
 
 
 def coverage(plan: EditPlan) -> float:
+    """Fraction of KEPT words covered by captions (cut words need none)."""
+    kept = {
+        wi
+        for seg in plan.segments
+        for wi in range(seg.keep_from_word, seg.keep_to_word + 1)
+    }
     covered = {
         wi for span in plan.captions for wi in range(span.from_word, span.to_word + 1)
     }
-    return len(covered) / max(1, len(plan.words))
+    return len(covered & kept) / max(1, len(kept))
 
 
 def write_srt(lines: list[CaptionLine], path: Path) -> Path:

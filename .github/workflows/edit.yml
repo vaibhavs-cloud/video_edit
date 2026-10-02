@@ -4,7 +4,7 @@ on:
   workflow_dispatch: # Worker + manual "Run workflow" share these inputs
     inputs:
       kind:
-        description: "new | fix"
+        description: "new | fix | fix-dryrun | fix-apply"
         type: string
         required: true
         default: "new"
@@ -68,8 +68,8 @@ jobs:
       - name: Install Python deps
         run: python -m pip install -r requirements.txt
 
-      - name: Download prior state (kind=fix)
-        if: inputs.kind == 'fix'
+      - name: Download prior state (kind=fix*)
+        if: inputs.kind == 'fix' || inputs.kind == 'fix-dryrun' || inputs.kind == 'fix-apply'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           STATE_REF: ${{ inputs.state_ref }}
@@ -90,6 +90,24 @@ jobs:
             "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip"
           mkdir -p out/run
           unzip -oq /tmp/state.zip -d out/run
+
+      - name: Download preview (kind=fix-apply)
+        if: inputs.kind == 'fix-apply'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STATE_REF: ${{ inputs.state_ref }}
+        run: |
+          set -euo pipefail
+          ART=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts?name=preview-$STATE_REF")
+          ID=$(jq -r '.artifacts[0].id // empty' <<<"$ART")
+          if [ -z "$ID" ]; then
+            echo "::error::no preview artifact preview-$STATE_REF — run fix-dryrun first"
+            exit 1
+          fi
+          curl -sfL -H "Authorization: Bearer $GH_TOKEN" -o /tmp/preview.zip \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip"
+          unzip -oq /tmp/preview.zip -d out/run
 
       - name: Download Telegram attachments
         if: inputs.attachments != '' && inputs.attachments != '[]'
@@ -115,6 +133,10 @@ jobs:
           set -euo pipefail
           if [ "$KIND" = "fix" ]; then
             python -m vedit fix --state out/run --instruction "$INSTRUCTION" --chat-id "$CHAT_ID"
+          elif [ "$KIND" = "fix-dryrun" ]; then
+            python -m vedit fix --state out/run --instruction "$INSTRUCTION" --dry-run
+          elif [ "$KIND" = "fix-apply" ]; then
+            python -m vedit fix --state out/run --apply-preview --chat-id "$CHAT_ID"
           else
             if [ -z "$IN_URL" ] && [ -z "$IN_FILE_ID" ]; then
               echo "::error::kind=new requires url or video_file_id"
@@ -127,6 +149,40 @@ jobs:
               --prompt "$IN_PROMPT" --chat-id "$CHAT_ID"
           fi
 
+      - name: Post dry-run confirmation to Telegram
+        if: inputs.kind == 'fix-dryrun' && steps.run.outcome == 'success'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ inputs.chat_id }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import pathlib
+          import httpx
+
+          from vedit.stage.fix import confirmation_text
+
+          token = os.environ["TELEGRAM_BOT_TOKEN"]
+          chat = os.environ["CHAT_ID"]
+          base = f"https://api.telegram.org/bot{token}"
+          preview = json.loads(pathlib.Path("out/run/fix_preview.json").read_text())
+          httpx.post(
+              base + "/sendMessage",
+              json={"chat_id": chat, "text": confirmation_text(preview)[:4000]},
+              timeout=60,
+          )
+          frame = preview.get("frame")
+          if frame:
+              with (pathlib.Path("out/run") / frame).open("rb") as fh:
+                  httpx.post(
+                      base + "/sendPhoto",
+                      data={"chat_id": chat},
+                      files={"photo": ("preview.jpg", fh, "image/jpeg")},
+                      timeout=120,
+                  )
+          PY
+
       - name: Send failure report to Telegram
         if: steps.run.outcome == 'failure' && inputs.chat_id != ''
         env:
@@ -134,6 +190,7 @@ jobs:
           CHAT_ID: ${{ inputs.chat_id }}
         run: |
           python - <<'PY'
+          import json
           import os
           import pathlib
           import httpx
@@ -143,8 +200,17 @@ jobs:
           base = f"https://api.telegram.org/bot{token}"
           report = pathlib.Path("out/run/edit_report.md")
           text = "run failed — no video produced"
-          if report.exists():
-              text = report.read_text(encoding="utf-8")[:3500]
+          preview_file = pathlib.Path("out/run/fix_preview.json")
+          if preview_file.exists():
+              try:
+                  preview = json.loads(preview_file.read_text(encoding="utf-8"))
+                  if not preview.get("ok"):
+                      text = f"can't do that yet: {preview.get('error', 'unknown error')}"
+              except ValueError:
+                  pass
+          if text.startswith("run failed"):
+              if report.exists():
+                  text = report.read_text(encoding="utf-8")[:3500]
           httpx.post(base + "/sendMessage", json={"chat_id": chat, "text": text}, timeout=60)
           if report.exists():
               with report.open("rb") as fh:
@@ -164,7 +230,7 @@ jobs:
           echo "sha8=${SHA:0:8}" >> "$GITHUB_OUTPUT"
 
       - name: Upload state artifact
-        if: steps.run.outcome == 'success'
+        if: steps.run.outcome == 'success' && inputs.kind != 'fix-dryrun'
         uses: actions/upload-artifact@v4
         with:
           name: state-${{ steps.ref.outputs.sha8 }}
@@ -181,6 +247,17 @@ jobs:
             out/run/.done.plan
             out/run/icons/**
             out/run/attachments/**
+
+      - name: Upload preview artifact (kind=fix-dryrun)
+        if: steps.run.outcome == 'success' && inputs.kind == 'fix-dryrun'
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-${{ inputs.state_ref }}
+          retention-days: 30
+          if-no-files-found: error
+          path: |
+            out/run/fix_preview.json
+            out/run/preview/**
 
       - name: Fail the job if the pipeline failed
         if: steps.run.outcome == 'failure'

@@ -93,10 +93,10 @@ Prereqs: `ffmpeg` (with `ass` filter), Python 3.12, Node 24, `git`, `gh`.
 
 5. **Worker (Cloudflare personal account)**
 
-   The Worker source is `infra/worker.mjs` with `infra/wrangler.toml`
-   (vars: `GH_OWNER`, `GH_REPO`; secrets: `TELEGRAM_BOT_TOKEN`,
-   `TELEGRAM_SECRET_PATH`, `TELEGRAM_SECRET_TOKEN`, `GH_TOKEN`,
-   `ALLOWED_CHAT_ID`). Deploy with wrangler (or the Cloudflare MCP), then:
+    The Worker source is `infra/worker.mjs` with `infra/wrangler.toml`
+    (vars: `GH_OWNER`, `GH_REPO`; secrets: `TELEGRAM_BOT_TOKEN`,
+    `TELEGRAM_SECRET_PATH`, `TELEGRAM_SECRET_TOKEN`, `GH_TOKEN`,
+    `ALLOWED_CHAT_ID`, `GROQ_API_KEY`). Deploy with wrangler (or the Cloudflare MCP), then:
 
    ```bash
    ./infra/set_webhook.sh
@@ -114,11 +114,13 @@ Prereqs: `ffmpeg` (with `ass` filter), Python 3.12, Node 24, `git`, `gh`.
      transitions (fade / rise / drift); no floating icons, ever.
    - Send **`done`** — v1 builds once with everything placed.
      `cancel` clears the staging area.
-   - Receive `final.mp4` + report caption ending in `state <sha8>`.
-   - **Reply** to that message with a correction:
-     `place image 1 at 0:20` · `remove the visual …` ·
-     `recaption 0:45: …` · `move the visual at 0:20 to 0:30`
-   - Unsupported instructions get a hint message — nothing re-renders.
+    - Receive `final.mp4` + report caption ending in `state <sha8>`.
+    - **Just talk to it** — no reply-to or keywords needed:
+      `that image at 30 is wrong, move it to 40` · `cut the boring intro` ·
+      `make the title punchier`. The bot previews every edit with input +
+      final-video times and a tagged frame — reply **YES** to apply.
+      (Reply-to-a-video still works for corrections too.)
+    - Unsupported instructions get a hint message — nothing re-renders.
 
 ### CLI (local runs)
 

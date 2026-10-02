@@ -85,6 +85,7 @@ class VisualsCfg:
     icon_size: int
     fade_s: float
     screenshot_width_frac: float
+    placement_span_s: float = 2.5  # owner-timestamp -> phrase span ("at 0:30")
 
 
 @dataclass(frozen=True)

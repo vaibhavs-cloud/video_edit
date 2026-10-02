@@ -556,10 +556,21 @@ def burn_captions(
         vf += ":fontsdir=fonts"
     ff.ffmpeg(
         [
+            "-y",
             "-i",
             concat_mp4.name,
             "-vf",
             vf,
+            "-c:v",
+            "libx264",
+            "-preset",
+            cfg.video.x264_preset,
+            "-crf",
+            str(cfg.video.x264_crf),
+            "-pix_fmt",
+            "yuv420p",
+            "-r",
+            str(cfg.video.fps),
             "-c:a",
             "copy",
             "-movflags",

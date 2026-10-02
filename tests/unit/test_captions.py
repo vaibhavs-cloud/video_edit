@@ -40,6 +40,35 @@ def test_coverage_is_full_for_full_spans(plan):
     assert captions.coverage(built) == 1.0
 
 
+def test_coverage_counts_kept_words_only():
+    from vedit.schema import (
+        CaptionSpan,
+        EditPlan,
+        PlanSource,
+        Reframe,
+        Segment,
+        Word,
+    )
+
+    words = [Word(i=i, t=f"w{i}", s=float(i), e=float(i) + 0.5) for i in range(10)]
+    segments = [
+        Segment(keep_from_word=0, keep_to_word=3, start=0.0, end=3.5),
+        Segment(keep_from_word=6, keep_to_word=9, start=6.0, end=9.5),
+    ]
+    plan = EditPlan(
+        source=PlanSource(ref="t", sha256="0" * 64, w=10, h=10, dur=12.0),
+        reframe=Reframe(mode="scale", aspect=0.5625, x_frac=0.5),
+        words=words,
+        segments=segments,
+        captions=[
+            CaptionSpan(from_word=0, to_word=3),
+            CaptionSpan(from_word=6, to_word=9),
+        ],
+        zoom_at_words=[],
+    )
+    assert captions.coverage(plan) == 1.0
+
+
 def test_emphasis_gets_ass_markup(plan, cfg):
     built, _ = plan
     lines = captions.build_lines(built, cfg)

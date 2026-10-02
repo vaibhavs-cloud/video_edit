@@ -4,7 +4,7 @@
 #
 # Required Cloudflare secrets (secret_text):
 #   TELEGRAM_BOT_TOKEN, TELEGRAM_SECRET_PATH, TELEGRAM_SECRET_TOKEN,
-#   GH_TOKEN, ALLOWED_CHAT_ID
+#   GH_TOKEN, ALLOWED_CHAT_ID, GROQ_API_KEY (talker: llama-3.1-8b-instant)
 # Bindings:
 #   PENDING_IMAGES = KV namespace "vedit-pending-images" (staged input images)
 # Non-secret vars:

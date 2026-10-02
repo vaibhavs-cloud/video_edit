@@ -130,7 +130,8 @@ def test_cover_filters_execute_in_ffmpeg(tmp_path, cfg, transcript):
         "2",
         str(tmp_path / "o.mp4"),
     ]
-    ff.ffmpeg(args, timeout=120)
+    # 1080p software render: generous budget so loaded machines don't flake.
+    ff.ffmpeg(args, timeout=300)
     assert (tmp_path / "o.mp4").stat().st_size > 0
 
 

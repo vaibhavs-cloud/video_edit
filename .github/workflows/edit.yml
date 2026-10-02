@@ -109,6 +109,24 @@ jobs:
             "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip"
           unzip -oq /tmp/preview.zip -d out/run
 
+      - name: Download video artifact (kind=deliver)
+        if: inputs.kind == 'deliver'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          STATE_REF: ${{ inputs.state_ref }}
+        run: |
+          set -euo pipefail
+          ART=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts?name=video-$STATE_REF")
+          ID=$(jq -r '.artifacts[0].id // empty' <<<"$ART")
+          if [ -z "$ID" ]; then
+            echo "::error::no video artifact video-$STATE_REF (expired after 7 days?) — re-run apply to rebuild it"
+            exit 1
+          fi
+          curl -sfL -H "Authorization: Bearer $GH_TOKEN" -o /tmp/video.zip \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$ID/zip"
+          unzip -oq /tmp/video.zip -d out/run
+
       - name: Download Telegram attachments
         if: inputs.attachments != '' && inputs.attachments != '[]'
         env:
@@ -269,6 +287,18 @@ jobs:
           path: |
             out/run/fix_preview.json
             out/run/preview/**
+
+      - name: Upload video artifact
+        if: steps.run.outcome == 'success' && inputs.kind != 'fix-dryrun' && inputs.kind != 'deliver'
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ steps.ref.outputs.sha8 }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            out/run/final.mp4
+            out/run/preview.mp4
+            out/run/contact_sheet.jpg
 
       - name: Fail the job if the pipeline failed
         if: steps.run.outcome == 'failure'

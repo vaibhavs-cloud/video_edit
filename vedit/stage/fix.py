@@ -46,6 +46,12 @@ class FixError(RuntimeError):
     pass
 
 
+# Safety floor: a cut/keep that removes less kept speech than this is almost
+# certainly aimed at already-cut silence (e.g. "cut 0:50 to 0:53" landing in
+# a gap). Refused with an explanatory FixError instead of a wasted render.
+CUT_MIN_KEPT_S = 0.2
+
+
 SUPPORTED = (
     'supported fixes: place an input image ("place image 1 at 0:20" — a timestamp '
     "is matched exactly to the input video transcript — or just "
@@ -366,6 +372,15 @@ def _same_segment(plan: EditPlan, lo: int, hi: int) -> bool:
     return True
 
 
+def _removed_kept_s(plan: EditPlan, lo: int, hi: int) -> float:
+    """Kept seconds the word range [lo, hi] covers (gaps contribute nothing)."""
+    start, end = plan.words[lo].s, plan.words[hi].e
+    total = 0.0
+    for seg in plan.segments:
+        total += max(0.0, min(end, seg.end) - max(start, seg.start))
+    return total
+
+
 def _cut_span(plan: EditPlan, lo: int, hi: int) -> tuple[list[Segment], list[str]]:
     """Remove word range [lo, hi] from kept segments (word-bound edges).
 
@@ -574,9 +589,17 @@ def apply_patch(
             lo, hi = hi, lo
         if not (0 <= lo < n and 0 <= hi < n):
             raise FixError(f"cut range {lo}..{hi} out of bounds (n={n})")
+        removed = _removed_kept_s(plan, lo, hi)
+        if removed < CUT_MIN_KEPT_S:
+            raise FixError(
+                f"that span holds only {removed:.1f}s of kept speech — "
+                "it is already silence. Name a speaking part instead "
+                "(quote the words to remove)."
+            )
         plan.segments, cut_notes = _cut_span(plan, lo, hi)
         notes.extend(cut_notes)
         _repair_cut(plan, lo, hi, notes)
+        notes.append(f"cut removed {removed:.1f}s of kept video")
 
     elif patch.op == FixOp.keep_range:
         lo, hi = patch.from_word, patch.to_word

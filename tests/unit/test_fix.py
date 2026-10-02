@@ -805,3 +805,50 @@ def test_deliver_guard_records_error_file(tmp_path, edit_plan, transcript, monke
         )
     err = (state / "last_error.txt").read_text(encoding="utf-8")
     assert "delivery failed" in err and "resend" in err
+
+
+def _gap_plan():
+    from vedit.schema import (
+        CaptionSpan,
+        EditPlan,
+        PlanSource,
+        Reframe,
+        Segment,
+        Transcript,
+        Word,
+    )
+
+    words = [Word(i=i, t=f"w{i}", s=float(i), e=float(i) + 0.5) for i in range(10)]
+    segments = [
+        Segment(keep_from_word=0, keep_to_word=3, start=0.0, end=3.5),
+        Segment(keep_from_word=6, keep_to_word=9, start=6.0, end=9.5),
+    ]
+    plan = EditPlan(
+        source=PlanSource(ref="t", sha256="0" * 64, w=10, h=10, dur=12.0),
+        reframe=Reframe(mode="scale", aspect=0.5625, x_frac=0.5),
+        words=words,
+        segments=segments,
+        captions=[
+            CaptionSpan(from_word=0, to_word=3),
+            CaptionSpan(from_word=6, to_word=9),
+        ],
+        zoom_at_words=[],
+    )
+    return plan, Transcript(words=words)
+
+
+def test_cut_gap_only_refused_as_already_silence():
+    plan, transcript = _gap_plan()
+    with pytest.raises(FixError, match="already silence"):
+        apply_patch(
+            FixPatch(op=FixOp.cut_range, from_word=4, to_word=5), plan, transcript
+        )
+
+
+def test_cut_real_span_reports_removed_duration():
+    plan, transcript = _gap_plan()
+    out, notes = apply_patch(
+        FixPatch(op=FixOp.cut_range, from_word=0, to_word=3), plan, transcript
+    )
+    assert [s.keep_from_word for s in out.segments] == [6]
+    assert any("cut removed 3.5s" in n for n in notes)

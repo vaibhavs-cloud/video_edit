@@ -32,17 +32,22 @@ Redelivery without re-render: `kind=deliver` downloads the latest state
 artifact and runs `vedit deliver` (QC-gated). The talker sends it for resend
 intents ("send it again", "I didn't get the video") with no preview step —
 the file already exists. Delivery failures persist `last_error.txt`, which
-the workflow failure step sends instead of the generic message.
+the workflow failure step sends instead of the generic message. Successful
+renders also upload a short-lived `video-<sha8>` artifact (`final.mp4` +
+preview + contact sheet, 7-day retention) so `kind=deliver` downloads the
+video instead of re-rendering; the artifact expires back to "re-run apply".
 
 ## Commands (run in the worker sandbox, same `--config`)
 
 1. Preview (never mutates run state except `fix_preview.json` + `preview/`):
    `vedit fix --state <state> --instruction "<free text>" --dry-run [--chat-id …]`
    - exit `0` = preview ready, `2` = cannot preview (`ok: false` in JSON).
-2. Apply (no LLM call; refuses if the plan drifted since preview):
+2. Apply (no LLM call; re-resolves the saved instruction when the plan moved
+   on, with a note — the YES authorized the instruction, not the byte-plan):
    `vedit fix --state <state> --apply-preview [--chat-id …]`
    - `SystemExit("no fix_preview.json …")` when no preview exists.
-   - `SystemExit("plan changed since preview …")` on drift — re-run step 1.
+   - Re-resolution failures surface as FixErrors; a preview without any
+     instruction still requires a fresh step 1.
 
 ## `state/fix_preview.json` schema
 

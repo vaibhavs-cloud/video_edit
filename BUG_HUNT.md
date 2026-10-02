@@ -67,6 +67,22 @@ preset / crf / pix_fmt / fps pins, mirroring `_encode_one_segment`). Required
 prerequisite: without it no cut/keep fix can ever deliver a fresh file
 (proven by the e2e cut flow failing on the stale `final.mp4`).
 
+**Status 2026-10-02 (live incidents, same day):**
+- Worker dispatched `attachments: [{id, note}]` objects but `cmd_attach`
+  expects file-id strings → Telegram 400 killed every fix carrying a staged
+  image. Fixed both sides: worker sends id strings, `cmd_attach` coerces
+  `{id}`/`{file_id}` objects and rejects malformed JSON cleanly.
+- `fix --apply-preview` refused on plan drift while the instruction was still
+  valid. It now re-resolves the saved instruction on the current plan (noted),
+  refusing only when the preview carries no instruction.
+- Cuts naming spans with < 0.2 s of kept speech (already-cut silence, e.g.
+  "cut 0:50 to 0:53" resolving to one 0.1 s word) are refused up front with
+  "already silence — name a speaking part" instead of burning a render.
+- Delivery is retried (timeouts/5xx/429, no retry on 400s), failures persist
+  `last_error.txt` which the workflow sends instead of the generic message,
+  and `kind=deliver` re-sends from a 7-day `video-<sha8>` artifact with no
+  re-render.
+
 ### H4 — Captions are timed on the lossless timeline but burned onto the crossfade-shortened video
 `build_lines` maps through lossless `TimelineMap` (`captions.py:49-89`);
 `concat_crossfade` shortens the video by one overlap per join

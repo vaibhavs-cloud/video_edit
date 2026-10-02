@@ -532,6 +532,29 @@ function extractJson(text) {
   }
 }
 
+// Best-effort rescue of a truncated/prosed model reply: pull the known
+// string fields straight out. Returns null unless action is a valid verb.
+function salvageTalkerJson(text) {
+  try {
+    const grab = (key) => {
+      const m = String(text || "").match(
+        new RegExp('"' + key + '"\\s*:\\s*"((?:[^"\\\\]|\\\\.)*)"'),
+      );
+      return m ? JSON.parse('"' + m[1] + '"') : "";
+    };
+    const action = grab("action");
+    if (!/^(chat|fix|yes|no|adjust)$/.test(action)) return null;
+    return {
+      action,
+      reply: String(grab("reply")).slice(0, 1000),
+      instruction: String(grab("instruction")),
+      state_ref: String(grab("state_ref")),
+    };
+  } catch {
+    return null;
+  }
+}
+
 // One small-model call per message (openai/gpt-oss-20b: fast, near-free).
 // Edit decisions NEVER happen here — the talker only classifies + rephrases;
 // the pipeline (dry-run preview -> explicit YES -> apply) decides.
@@ -563,48 +586,62 @@ async function askTalker(env, ctx) {
     "- yes: user confirms the pending edit (yes/yeah/do it/confirm/done...). reply = short ack.\n" +
     "- no: user rejects or cancels. reply = short ack.\n" +
     "- adjust: user tweaks the pending edit ('make it 0:40 instead'). instruction = the REVISED full edit. reply = short ack.\n" +
+    "- Multiple edits in one message: instruction = the FIRST edit only; reply names it and promises the rest next.\n" +
     "- Fix requested but no state ref exists anywhere: action chat, reply asks which video.\n" +
     "- Pending exists but the message is unrelated chit-chat: action chat, leave pending alone.";
-  try {
-    const resp = await fetch(GROQ_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${env.GROQ_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: CHAT_MODEL,
-        temperature: 0.4,
-        max_tokens: 400,
-        messages: [
-          { role: "system", content: system },
-          ...ctx.turns.map((t) => ({
-            role: t.r === "a" ? "assistant" : "user",
-            content: t.t,
-          })),
-          { role: "user", content: ctx.text },
-        ],
-      }),
-    });
-    if (!resp.ok) throw new Error(`groq ${resp.status}`);
-    const data = await resp.json();
-    const content = data?.choices?.[0]?.message?.content || "";
-    const parsed = extractJson(content);
-    if (parsed && typeof parsed.action === "string") {
-      return {
-        action: parsed.action,
-        reply: String(parsed.reply || "").slice(0, 1000),
-        instruction: String(parsed.instruction || ""),
-        state_ref: String(parsed.state_ref || ""),
-      };
+  const messages = [
+    { role: "system", content: system },
+    ...ctx.turns.map((t) => ({
+      role: t.r === "a" ? "assistant" : "user",
+      content: t.t,
+    })),
+    { role: "user", content: ctx.text },
+  ];
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const resp = await fetch(GROQ_URL, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${env.GROQ_API_KEY}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: CHAT_MODEL,
+          temperature: 0.3,
+          max_tokens: 800,
+          messages:
+            attempt === 0
+              ? messages
+              : [
+                  ...messages,
+                  {
+                    role: "user",
+                    content:
+                      "Your last reply was not valid JSON. Reply with raw JSON only.",
+                  },
+                ],
+        }),
+      });
+      if (!resp.ok) throw new Error(`groq ${resp.status}`);
+      const data = await resp.json();
+      const content = data?.choices?.[0]?.message?.content || "";
+      const parsed = extractJson(content) || salvageTalkerJson(content);
+      if (parsed && typeof parsed.action === "string") {
+        return {
+          action: parsed.action,
+          reply: String(parsed.reply || "").slice(0, 1000),
+          instruction: String(parsed.instruction || ""),
+          state_ref: String(parsed.state_ref || ""),
+        };
+      }
+    } catch {
+      // fall through to the quiet retry, then the garbled-reply fallback
     }
-    return { action: "chat", reply: content.slice(0, 1000) || "noted." };
-  } catch {
-    return {
-      action: "chat",
-      reply: "hmm, my brain hiccuped — say that again?",
-    };
   }
+  return {
+    action: "chat",
+    reply: "hmm, that came out garbled — say the edit again?",
+  };
 }
 
 function fmtTime(sec) {

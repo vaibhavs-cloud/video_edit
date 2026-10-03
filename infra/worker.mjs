@@ -86,6 +86,11 @@ async function handleUpdate(update, env) {
   const msg = update.message || update.edited_message || update.channel_post;
   if (!msg) return;
 
+  // Telegram retries an update when the reply is slow; never process twice.
+  if (update.update_id != null && (await markUpdateSeen(env, update.update_id))) {
+    return;
+  }
+
   const chatId = String(msg.chat?.id ?? "");
   if (chatId !== String(env.ALLOWED_CHAT_ID)) {
     return; // public surface: ignore everyone but the owner
@@ -462,6 +467,20 @@ async function clearVideo(env, chatId) {
 
 // ---- GPT-style talk: dialogue memory, pending confirms, state lookup ----
 
+// Already-processed Telegram update ids (retries after slow Groq calls).
+// Returns true when this update was seen before.
+async function markUpdateSeen(env, updateId) {
+  try {
+    if (!env.PENDING_IMAGES) return false;
+    const key = `seen:${updateId}`;
+    if (await env.PENDING_IMAGES.get(key)) return true;
+    await env.PENDING_IMAGES.put(key, "1", { expirationTtl: 600 });
+    return false;
+  } catch {
+    return false;
+  }
+}
+
 function convKey(chatId) {
   return `conv:${chatId}`;
 }
@@ -607,6 +626,11 @@ async function askTalker(env, ctx) {
     "recaption, add/remove zooms, replace icons. Times the user gives mean the " +
     "ORIGINAL uploaded video; the pipeline shows both clocks at confirm time — " +
     "never convert or second-guess times.\n" +
+    "The pipeline already transcribed the FULL video — every spoken word with " +
+    "timestamps lives in the plan. NEVER ask the user to send or provide the " +
+    "transcript. To place something 'where I talk about X': proceed to preview " +
+    "(the planner maps phrases to words); if nothing matches, ask for a TIME, " +
+    "never the transcript.\n" +
     "You CANNOT: music, effects, new footage, speed changes, caption styling. " +
     "Say so plainly and offer the closest alternative.\n\n" +
     "Decide ONE action, reply with raw JSON only:\n" +

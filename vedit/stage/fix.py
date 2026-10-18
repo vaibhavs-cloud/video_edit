@@ -115,7 +115,7 @@ def _build_prompt(
 
 OPS (pick exactly one):
 - replace_icon: target visual changed; set visual_id + keyword (the new concept, e.g. "shield")
-- remove_visual: drop a visual; set visual_id
+- remove_visual: drop a visual; set visual_id, OR omit it and set the time in from_word when the user names a time instead of an id ("remove the image at 0:54" — code picks the overlay there).
 - recaption: replace caption text; set from_word (start of the target caption) + text
 - retime_visual: move a visual in time; set visual_id + from_word + to_word (source word indices)
 - cut_range: REMOVE a span from the video; set from_word + to_word (source word indices, normalized if reversed). E.g. "cut 0:30 to 0:45", "remove the intro", "delete where I say um". This is the ONLY op that removes footage — remove_visual only drops an overlay.
@@ -233,6 +233,32 @@ def _anchor_note(transcript: Transcript, lo: int, hi: int) -> str:
     return f"input {words[lo].s:.1f}s (words {lo}..{hi} '{phrase}')"
 
 
+def _nearest_visual(plan: EditPlan, word: int):
+    """Visual covering ``word``, else the closest one by word distance."""
+
+    def dist(v) -> int:
+        if v.from_word <= word <= v.to_word:
+            return 0
+        return min(abs(v.from_word - word), abs(v.to_word - word))
+
+    return min(plan.visuals, key=dist) if plan.visuals else None
+
+
+def _salvage_op(instruction: str, patch: FixPatch, plan: EditPlan) -> FixPatch:
+    """Recover an obvious op the model punted on as ``unknown``.
+
+    Time-anchored removals ("remove the image at 00:54") are unambiguous once
+    the transcript is known, so resolve them instead of failing the whole fix.
+    """
+    if patch.op != FixOp.unknown or not plan.visuals:
+        return patch
+    text = (instruction or "").lower()
+    if any(w in text for w in ("remove", "delete", "drop", "get rid", "take out")):
+        patch.op = FixOp.remove_visual
+        patch.note = None
+    return patch
+
+
 def _apply_time_anchor(
     patch: FixPatch,
     instruction: str,
@@ -288,6 +314,12 @@ def _apply_time_anchor(
             if tokens and patch.from_word is None:
                 lo, hi = resolve_span(tokens[-1], words, plan.segments, span_s)
                 patch.from_word, patch.to_word = lo, hi
+        elif patch.op == FixOp.remove_visual:
+            # "remove the image at 0:54" — target the visual at that spot
+            pt = resolve_point(tokens[-1], words, plan.segments)
+            v = _nearest_visual(plan, pt)
+            if v is not None:
+                patch.visual_id = v.id
     except AnchorError:
         pass
     return patch
@@ -327,6 +359,7 @@ def parse_fix(
             time.sleep(cfg.retry.llm_backoff_s * attempt)
     if patch is None:
         raise FixError(f"could not parse the correction: {last}")
+    patch = _salvage_op(instruction, patch, plan)
     return _apply_time_anchor(
         patch, instruction, plan, transcript, cfg.visuals.placement_span_s
     )

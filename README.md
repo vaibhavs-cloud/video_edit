@@ -110,8 +110,11 @@ Prereqs: `ffmpeg` (with `ass` filter), Python 3.12, Node 24, `git`, `gh`.
    - Send **images**, each captioned with a label + placement in any
      timestamp format: `pyramid at 0:20` · `diagram 0:45-0:50` ·
      `chart @1m20s`. No caption = planner places it where it fits.
-     Images fill the whole frame (center-cropped) with subtle varied
-     transitions (fade / rise / drift); no floating icons, ever.
+     Placement is adaptive: shots already shaped like a reel fill the
+     frame; other aspect ratios keep full visibility on a blurred,
+     aspect-filled backdrop (no hard cropping). `screenshot_mode` in
+     `config.yaml` switches to `cover` (crop to fill) or `overlay`
+     (floating box).
    - Send **`done`** — v1 builds once with everything placed.
      `cancel` clears the staging area.
     - Receive `final.mp4` + report caption ending in `state <sha8>`.

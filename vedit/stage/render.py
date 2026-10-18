@@ -49,6 +49,7 @@ class OverlayPlan:
     fade_out: float
     fx: str = "fade"  # fade | rise | drift (screenshots in cover mode only)
     fx_dur: float = 0.0  # local duration the motion runs over (drift)
+    fit_blur: bool = False  # blurred background + contained image (adaptive)
 
 
 def ensure_base(source: Path, plan: EditPlan, workdir: Path, cfg: Config) -> Path:
@@ -134,22 +135,36 @@ def _overlays_for_segment(
             continue
 
         is_shot = v.kind == "screenshot"
-        cover = is_shot and cfg.visuals.screenshot_mode == "cover"
+        mode = cfg.visuals.screenshot_mode
+        W, H = cfg.video.width, cfg.video.height
+        reel_ar = W / H
+
+        # "adaptive" picks per image: a shot already close to the reel's 9:16
+        # fills the frame (cover); anything else keeps full visibility on a
+        # blurred, aspect-filled backdrop instead of being cropped to bits.
+        fit_blur = False
+        if is_shot and v.scale >= 1.0 and mode in ("adaptive", "fit"):
+            iw, ih = _image_size(rv.asset)
+            ar = iw / max(1, ih)
+            if mode == "fit" or abs(ar - reel_ar) / reel_ar > 0.25:
+                fit_blur = True
+
+        cover = is_shot and not fit_blur and mode in ("cover", "adaptive", "fit")
         full_cover = cover and v.scale >= 1.0
-        if full_cover:
-            aw, ah = cfg.video.width, cfg.video.height
+        if fit_blur or full_cover:
+            aw, ah = W, H
             x, y = 0, 0
         elif cover:
             # zoomed-out cover: fraction of the frame, resolution-independent
-            w0 = max(2, int(cfg.video.width * v.scale) // 2 * 2)
-            h0 = max(2, int(cfg.video.height * v.scale) // 2 * 2)
+            w0 = max(2, int(W * v.scale) // 2 * 2)
+            h0 = max(2, int(H * v.scale) // 2 * 2)
             aw, ah = w0 + 12, h0 + 12
             x, y = _place(v.pos, aw, ah, cfg)
-            x = min(max(x, 0), cfg.video.width - aw)
-            y = min(max(y, 0), cfg.video.height - ah)
+            x = min(max(x, 0), W - aw)
+            y = min(max(y, 0), H - ah)
         elif is_shot:
             iw, ih = _image_size(rv.asset)
-            target_w = int(cfg.video.width * cfg.visuals.screenshot_width_frac)
+            target_w = int(W * cfg.visuals.screenshot_width_frac)
             target_w = max(2, int(target_w * v.scale) // 2 * 2)
             target_h = max(2, int(ih * (target_w / iw)))
             aw, ah = target_w + 12, target_h + 12  # + border pad
@@ -158,7 +173,7 @@ def _overlays_for_segment(
             aw = max(2, int(iw * v.scale))
             ah = max(2, int(ih * v.scale))
 
-        if not cover:
+        if not cover and not fit_blur:
             x, y = _place(v.pos, aw, ah, cfg)
             if x < 0 or y < 0 or x + aw > cfg.video.width or y + ah > cfg.video.height:
                 raise RenderError(
@@ -175,8 +190,8 @@ def _overlays_for_segment(
         fout = 0.0 if vis_end > seg_end - 1e-3 else min(fade, in_dur * 0.4)
         fx = fx_list[idx % len(fx_list)] if full_cover else "fade"
 
-        if full_cover:
-            w, h = cfg.video.width, cfg.video.height
+        if full_cover or fit_blur:
+            w, h = W, H
         else:
             w, h = aw - (12 if is_shot else 0), ah - (12 if is_shot else 0)
         out.append(
@@ -192,6 +207,7 @@ def _overlays_for_segment(
                 fade_out=fout,
                 fx=fx,
                 fx_dur=in_dur,
+                fit_blur=fit_blur,
             )
         )
     return out
@@ -217,6 +233,35 @@ def _filter_for_segment(
     parts = list(chain)
     W, H = cfg.video.width, cfg.video.height
     for k, ov in enumerate(overlays, start=1):
+        if ov.fit_blur:
+            # Keep the whole image visible: blurred, aspect-filled backdrop
+            # behind a contained copy, then fade the composite as one unit.
+            blur = max(8, min(W, H) // 24)
+            parts.append(f"[{k + 1}:v]format=rgba,split[bg{k}][fg{k}]")
+            parts.append(
+                f"[bg{k}]scale={W}:{H}:force_original_aspect_ratio=increase:"
+                f"flags=lanczos,crop={W}:{H},gblur=sigma={blur}[bgv{k}]"
+            )
+            parts.append(
+                f"[fg{k}]scale={W}:{H}:force_original_aspect_ratio=decrease:"
+                f"flags=lanczos[fgv{k}]"
+            )
+            comp = f"[bgv{k}][fgv{k}]overlay=x=(W-w)/2:y=(H-h)/2"
+            if ov.fade_in > 0:
+                comp += f",fade=t=in:st={ov.local_start:.3f}:d={ov.fade_in:.3f}:alpha=1"
+            if ov.fade_out > 0:
+                comp += (
+                    f",fade=t=out:st={max(0.0, ov.local_end - ov.fade_out):.3f}:"
+                    f"d={ov.fade_out:.3f}:alpha=1"
+                )
+            parts.append(f"{comp}[ov{k}]")
+            parts.append(
+                f"{current}[ov{k}]overlay=x=0:y=0:"
+                f"enable='between(t,{ov.local_start:.3f},{ov.local_end:.3f})'[v{k}]"
+            )
+            current = f"[v{k}]"
+            continue
+
         img_parts = [f"[{k + 1}:v]format=rgba"]
         if ov.w == W and ov.h == H and ov.fx in ("fade", "rise", "drift"):
             # full-frame cover: scale up, center-crop (drift pre-scales larger)
@@ -236,7 +281,10 @@ def _filter_for_segment(
             dw, dh = ov.w, ov.h
             img_parts.append(f"scale={dw}:{dh}:flags=lanczos")
         if ov.fade_in > 0:
-            img_parts.append(f"fade=t=in:st=0:d={ov.fade_in:.3f}:alpha=1")
+            # start the fade where the overlay appears, not at t=0 (pop-in fix)
+            img_parts.append(
+                f"fade=t=in:st={ov.local_start:.3f}:d={ov.fade_in:.3f}:alpha=1"
+            )
         if ov.fade_out > 0:
             img_parts.append(
                 f"fade=t=out:st={max(0.0, ov.local_end - ov.fade_out):.3f}:d={ov.fade_out:.3f}:alpha=1"
@@ -296,6 +344,7 @@ def _segment_fingerprint(
                     round(ov.fade_out, 3),
                     ov.fx,
                     round(ov.fx_dur, 3),
+                    ov.fit_blur,
                 )
             ).encode()
         )

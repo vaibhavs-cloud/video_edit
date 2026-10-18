@@ -36,7 +36,15 @@ def _visuals(n: int, transcript) -> list:
     return out
 
 
+def _cover_cfg(cfg):
+    """Cover-mode variant: these tests pin the crop-to-fill behaviour."""
+    return dataclasses.replace(
+        cfg, visuals=dataclasses.replace(cfg.visuals, screenshot_mode="cover")
+    )
+
+
 def test_cover_fills_frame_and_cycles_transitions(tmp_path, cfg, transcript):
+    cfg = _cover_cfg(cfg)
     asset = _shot(tmp_path)
     visuals = _visuals(4, transcript)
     resolved = [ResolvedVisual(visual=v, asset=asset) for v in visuals]
@@ -57,6 +65,7 @@ def transcript_plan(transcript):
 
 
 def test_filter_has_cover_chain_and_motion(tmp_path, cfg, transcript):
+    cfg = _cover_cfg(cfg)
     asset = _shot(tmp_path)
     resolved = [ResolvedVisual(visual=v, asset=asset) for v in _visuals(3, transcript)]
     seg = (0.0, transcript.words[8].e + 1.0)
@@ -75,7 +84,10 @@ def test_empty_transitions_falls_back_to_fade(tmp_path, cfg, transcript):
     import dataclasses
 
     cfg2 = dataclasses.replace(
-        cfg, visuals=dataclasses.replace(cfg.visuals, transitions=[])
+        cfg,
+        visuals=dataclasses.replace(
+            cfg.visuals, transitions=[], screenshot_mode="cover"
+        ),
     )
     asset = _shot(tmp_path)
     resolved = [ResolvedVisual(visual=_visuals(1, transcript)[0], asset=asset)]
@@ -90,6 +102,7 @@ def test_cover_filters_execute_in_ffmpeg(tmp_path, cfg, transcript):
     """Escaping bugs in overlay expressions only surface at render time."""
     from vedit import ff
 
+    cfg = _cover_cfg(cfg)
     asset = _shot(tmp_path)
     resolved = [ResolvedVisual(visual=v, asset=asset) for v in _visuals(3, transcript)]
     seg = (0.0, transcript.words[8].e + 1.0)
@@ -280,6 +293,7 @@ def test_scaled_cover_centers_inside_frame(tmp_path, cfg, transcript):
 
 
 def test_full_cover_unchanged(tmp_path, cfg, transcript):
+    cfg = _cover_cfg(cfg)
     v = Visual(
         id="v1",
         kind="screenshot",
@@ -295,3 +309,60 @@ def test_full_cover_unchanged(tmp_path, cfg, transcript):
         seg[0], seg[1], resolved, transcript_plan(transcript), cfg
     )
     assert [(p.x, p.y, p.w, p.h) for p in plans] == [(0, 0, 1080, 1920)]
+
+
+def _adaptive_cfg(cfg):
+    return dataclasses.replace(
+        cfg, visuals=dataclasses.replace(cfg.visuals, screenshot_mode="adaptive")
+    )
+
+
+def test_adaptive_wide_image_uses_blur_fit(tmp_path, cfg, transcript):
+    from PIL import Image
+
+    wide = tmp_path / "wide.png"
+    Image.new("RGB", (800, 200), (10, 60, 120)).save(wide)  # 4:1 landscape
+    v = Visual(id="v1", kind="screenshot", file="wide.png", from_word=10, to_word=19)
+    resolved = [ResolvedVisual(visual=v, asset=wide)]
+    seg = (0.0, transcript.words[19].e + 1.0)
+    plans = render._overlays_for_segment(
+        seg[0], seg[1], resolved, transcript_plan(transcript), _adaptive_cfg(cfg)
+    )
+    assert len(plans) == 1
+    assert plans[0].fit_blur is True
+    assert (plans[0].w, plans[0].h) == (1080, 1920)
+
+
+def test_adaptive_reel_shaped_image_uses_cover(tmp_path, cfg, transcript):
+    from PIL import Image
+
+    tall = tmp_path / "tall.png"
+    Image.new("RGB", (540, 960), (10, 60, 120)).save(tall)  # exactly 9:16
+    v = Visual(id="v1", kind="screenshot", file="tall.png", from_word=10, to_word=19)
+    resolved = [ResolvedVisual(visual=v, asset=tall)]
+    seg = (0.0, transcript.words[19].e + 1.0)
+    plans = render._overlays_for_segment(
+        seg[0], seg[1], resolved, transcript_plan(transcript), _adaptive_cfg(cfg)
+    )
+    assert plans[0].fit_blur is False
+    assert (plans[0].x, plans[0].y, plans[0].w, plans[0].h) == (0, 0, 1080, 1920)
+
+
+def test_fit_blur_filter_graph_composites(tmp_path, cfg, transcript):
+    from PIL import Image
+
+    wide = tmp_path / "wide.png"
+    Image.new("RGB", (800, 200), (10, 60, 120)).save(wide)
+    v = Visual(id="v1", kind="screenshot", file="wide.png", from_word=10, to_word=19)
+    resolved = [ResolvedVisual(visual=v, asset=wide)]
+    seg = (0.0, transcript.words[19].e + 1.0)
+    plans = render._overlays_for_segment(
+        seg[0], seg[1], resolved, transcript_plan(transcript), _adaptive_cfg(cfg)
+    )
+    graph, _vlabel = render._filter_for_segment(
+        seg[0], seg[1], plans, False, _adaptive_cfg(cfg)
+    )
+    assert "gblur=sigma=" in graph
+    assert "force_original_aspect_ratio=decrease" in graph
+    assert "overlay=x=(W-w)/2:y=(H-h)/2" in graph
+    assert "overlay=x=0:y=0:" in graph  # composite placed full-frame

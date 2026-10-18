@@ -548,6 +548,44 @@ def test_parse_fix_mock_resize_heuristic(edit_plan, transcript, cfg):
     assert p.scale == 0.7
 
 
+def test_remove_visual_by_time_targets_nearest(edit_plan, transcript, cfg):
+    # "remove the image at <time>" must resolve to the overlay at that spot,
+    # not the first visual, even when the model punts to unknown.
+    from vedit.stage.fix import _nearest_visual
+
+    target = edit_plan.visuals[-1]
+    mid = (target.from_word + target.to_word) // 2
+    t = transcript.words[mid].s
+    patch = parse_fix(
+        f"remove the image at {t:.1f} seconds",
+        edit_plan,
+        transcript,
+        cfg,
+        mock=True,
+    )
+    assert patch.op == FixOp.remove_visual
+    assert patch.visual_id == target.id
+    assert _nearest_visual(edit_plan, mid).id == target.id
+
+
+def test_salvage_unknown_remove_with_time(edit_plan, transcript):
+    from vedit.stage.fix import _apply_time_anchor, _salvage_op
+
+    target = edit_plan.visuals[-1]
+    mid = (target.from_word + target.to_word) // 2
+    t = transcript.words[mid].s
+    patch = FixPatch(op=FixOp.unknown, note="x")
+    patch = _salvage_op(f"remove the image at {t:.1f}s", patch, edit_plan)
+    assert patch.op == FixOp.remove_visual
+    patch = _apply_time_anchor(
+        patch, f"remove the image at {t:.1f}s", edit_plan, transcript, 2.5
+    )
+    assert patch.visual_id == target.id
+    out, notes = apply_patch(patch, edit_plan, transcript)
+    assert all(v.id != target.id for v in out.visuals)
+    assert any("remove_visual" in n for n in notes)
+
+
 def test_preview_fix_place_reports_both_timelines(edit_plan, transcript, segments, cfg):
     from vedit.stage.fix import confirmation_text, preview_fix
 

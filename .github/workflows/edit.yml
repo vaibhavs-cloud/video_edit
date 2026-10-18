@@ -213,6 +213,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           CHAT_ID: ${{ inputs.chat_id }}
+          KIND: ${{ inputs.kind }}
         run: |
           python - <<'PY'
           import json
@@ -222,26 +223,28 @@ jobs:
 
           token = os.environ["TELEGRAM_BOT_TOKEN"]
           chat = os.environ["CHAT_ID"]
+          kind = os.environ.get("KIND", "")
           base = f"https://api.telegram.org/bot{token}"
           report = pathlib.Path("out/run/edit_report.md")
           text = "run failed — no video produced"
           err_file = pathlib.Path("out/run/last_error.txt")
+          preview_file = pathlib.Path("out/run/fix_preview.json")
           if err_file.exists():
               text = err_file.read_text(encoding="utf-8")[:3500]
-          else:
-              preview_file = pathlib.Path("out/run/fix_preview.json")
-              if preview_file.exists():
-                  try:
-                      preview = json.loads(preview_file.read_text(encoding="utf-8"))
-                      if not preview.get("ok"):
-                          text = f"can't do that yet: {preview.get('error', 'unknown error')}"
-                  except ValueError:
-                      pass
-          if text.startswith("run failed"):
-              if report.exists():
-                  text = report.read_text(encoding="utf-8")[:3500]
+          elif preview_file.exists():
+              try:
+                  preview = json.loads(preview_file.read_text(encoding="utf-8"))
+                  if not preview.get("ok"):
+                      text = f"can't do that yet — {preview.get('error', 'unknown error')}"
+              except ValueError:
+                  pass
+          # a preview that couldn't happen has no report worth sending; the
+          # report is only meaningful when a real render died.
+          send_report = kind not in ("fix-dryrun",) and report.exists()
+          if text.startswith("run failed") and send_report:
+              text = report.read_text(encoding="utf-8")[:3500]
           httpx.post(base + "/sendMessage", json={"chat_id": chat, "text": text}, timeout=60)
-          if report.exists():
+          if send_report:
               with report.open("rb") as fh:
                   httpx.post(
                       base + "/sendDocument",

@@ -28,6 +28,29 @@ JSON/MD/SRT/ASS + markers — **never media**). A fix run patches
 `edit_plan.json` (structured op) and re-renders; it never re-transcribes or
 re-plans.
 
+### Telegram commands (deterministic — no LLM parsing)
+
+| Command | Effect |
+|---|---|
+| `/new` + video link or upload | stage a new video |
+| `/addimage` + photo | stage an image (label + time optional in the caption, e.g. `pyramid at 0:20`) |
+| `/build` or `done` | start the edit run |
+| `/cut 0:30 0:45`, `/keep 0:10 1:00` | remove / keep only a span |
+| `/place image 3 at 0:20` | attach staged image at a time |
+| `/size image 3 60%` (or `bigger`) | resize an overlay |
+| `/recaption image 3 Crunchy build` | reword an overlay label text |
+| `/preset punchy` | audio recipe (`clean_voice` / `punchy` / `flat`; noise cancelling always stays on) |
+| `/editimage [N]` | menu: fill the reel / fit+blur / floating box, crop top/center/bottom, size buttons |
+| dry-run Yes/No buttons (or `yes` / `no`) | apply or drop the previewed fix |
+| `/apply` `/reject` `/redo <sha8>` | manage a pending preview |
+| `/deliver` | resend the last video |
+| `/status` | is the run queued / running / done? |
+| `/list` `/cancel` `/help` | current run contents, empty staging, the menu |
+
+Free text falls back to the Groq talker (`good caption?` → small talk,
+"push that caption earlier" → previewed fix). Dry-run previews never consume
+staging, and confirmations show both input and final-video times.
+
 ## Repository map
 
 | Path | What |

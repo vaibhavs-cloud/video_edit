@@ -192,9 +192,19 @@ jobs:
           # the run even after the pending-confirm window expires.
           text = confirmation_text(preview)[:3900]
           text += f"\nstate {os.environ['STATE_REF']}"
+          # deterministic YES/NO buttons — the relay answers these directly
+          ref = os.environ["STATE_REF"]
+          keyboard = {
+              "inline_keyboard": [
+                  [
+                      {"text": "✅ Apply", "callback_data": f"apply:{ref}"},
+                      {"text": "✖ No", "callback_data": f"reject:{ref}"},
+                  ]
+              ]
+          }
           httpx.post(
               base + "/sendMessage",
-              json={"chat_id": chat, "text": text},
+              json={"chat_id": chat, "text": text, "reply_markup": keyboard},
               timeout=60,
           )
           frame = preview.get("frame")

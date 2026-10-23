@@ -207,7 +207,17 @@ def s_acquire(ctx: Ctx) -> None:
 
 
 def s_audio(ctx: Ctx) -> None:
-    paths = audio_stage.prepare(ctx.state / "source.mp4", ctx.work, ctx.cfg)
+    cfg = ctx.cfg
+    preset_file = ctx.state / "preset.json"
+    if preset_file.exists():
+        try:
+            cfg = audio_stage.with_preset(
+                cfg, str(st.load_json(preset_file).get("preset") or "")
+            )
+        except audio_stage.AudioError as exc:
+            _warn(f"[audio] preset ignored: {exc}")
+            cfg = audio_stage.with_preset(cfg, None)
+    paths = audio_stage.prepare(ctx.state / "source.mp4", ctx.work, cfg)
     _log(f"[audio] clean track ready ({paths.clean_48k.name})")
 
 
@@ -680,8 +690,25 @@ def cmd_fix(args: argparse.Namespace) -> int:
             icons_enabled=ctx.cfg.visuals.icons_enabled,
             screenshots=shots,
             max_zooms=zoom_cap,
+            presets=set(ctx.cfg.audio.presets or {}),
         )
         notes = notes_prefix + notes
+
+        if patch.op == FixOp.set_preset:
+            name = (patch.text or "").strip()
+            try:
+                audio_stage.with_preset(ctx.cfg, name)
+            except audio_stage.AudioError as exc:
+                raise fix_stage.FixError(str(exc)) from exc
+            st.save_json(state / "preset.json", {"preset": name})
+            work_audio = state / "work" / "audio"
+            for f in ("clean_48k.wav", "stt_16k.wav"):
+                stale = work_audio / f
+                if stale.exists():
+                    stale.unlink()
+            # re-prep audio only; the transcript marker stays valid
+            st.clear_stage(state, "audio")
+            _log(f"[fix] audio recipe set to '{name}' — rebuilding the clean track")
     except fix_stage.FixError as exc:
         _log(f"[fix] {exc}")
         if ctx.chat_id:

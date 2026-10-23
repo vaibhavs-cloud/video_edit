@@ -54,6 +54,18 @@ def clear_from(state: Path, stage: str) -> None:
             p.unlink()
 
 
+def clear_stage(state: Path, stage: str) -> None:
+    """Remove exactly ONE stage marker.
+
+    Unlike clear_from (which invalidates everything downstream), this lets a
+    fix re-run a single stage — e.g. re-prep audio for a new /preset without
+    re-transcribing the video.
+    """
+    if stage not in STAGES:
+        raise StateError(f"unknown stage: {stage}")
+    marker(state, stage).unlink(missing_ok=True)
+
+
 def run_stage(state: Path, stage: str, fn: Callable[[], Any]) -> Any:
     """Run fn unless the stage marker exists; always mark on success."""
     if is_done(state, stage):

@@ -55,6 +55,10 @@ class AudioCfg:
     channels: int = 2
     denoise_reduction_db: float = 12
     volume_gain_db: float = 0
+    # named recipes for /preset; values may override any field above EXCEPT the
+    # denoise pair (afftdn_nf / denoise_reduction_db) — noise cancelling is a
+    # hard default and cannot be disabled by a recipe.
+    presets: dict[str, dict[str, float]] | None = None
 
 
 @dataclass(frozen=True)

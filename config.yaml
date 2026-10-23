@@ -48,6 +48,32 @@ audio:
   # extra gain after loudnorm (0 = off); positive gains are limited back to
   # loudnorm_tp so true peak never exceeds the ceiling
   volume_gain_db: 3
+  # Named recipes for the Telegram /preset command (set_preset fix op).
+  # Every recipe keeps the afftdn denoise stage: afftdn_nf and
+  # denoise_reduction_db are intentionally untouched here (and rejected with
+  # an error if a recipe ever sets them) — noise cancelling is the default.
+  presets:
+    clean_voice: # speech-forward: airier, mid compression, no mud
+      bass_boost_gain_db: 0
+      comp_threshold_db: -16
+      comp_ratio: 3.5
+      comp_release_ms: 150
+      loudnorm_i: -16
+      volume_gain_db: 3
+    punchy: # louder + tighter for short-form social clips
+      bass_boost_gain_db: 5
+      comp_threshold_db: -20
+      comp_ratio: 4
+      comp_attack_ms: 8
+      comp_release_ms: 120
+      loudnorm_i: -14
+      volume_gain_db: 4
+    flat: # documentary neutral — minimal processing
+      bass_boost_gain_db: 0
+      comp_threshold_db: -24
+      comp_ratio: 2
+      loudnorm_i: -18
+      volume_gain_db: 0
 
 video:
   width: 1080

@@ -71,6 +71,12 @@ class Visual(BaseModel):
     pos: Literal["top", "bottom", "top-right", "top-left", "center"] = "top-right"
     zoom: bool = False
     scale: float = Field(default=1.0, ge=0.2, le=1.0)  # fraction of natural size
+    # per-visual display override (None = follow visuals.screenshot_mode):
+    # cover = crop to fill the reel, adaptive = blur backdrop + contained image,
+    # overlay = floating box; "fit" is a legacy alias of adaptive.
+    mode: Literal["cover", "adaptive", "fit", "overlay"] | None = None
+    # crop anchor when cropping to fill (top/center/bottom thirds)
+    crop_focus: Literal["top", "center", "bottom"] | None = None
 
     @model_validator(mode="after")
     def _check(self) -> Visual:
@@ -218,6 +224,8 @@ class FixOp(str, Enum):
     add_zoom = "add_zoom"
     remove_zoom = "remove_zoom"
     resize_visual = "resize_visual"
+    set_visual_mode = "set_visual_mode"
+    set_preset = "set_preset"
     unknown = "unknown"
 
 
@@ -230,6 +238,9 @@ class FixPatch(BaseModel):
     text: str | None = None
     file: str | None = None
     scale: float | None = None
+    mode: Literal["cover", "adaptive", "fit", "overlay"] | None = None
+    crop_focus: Literal["top", "center", "bottom"] | None = None
+    preset: str | None = None
     note: str | None = None
 
 

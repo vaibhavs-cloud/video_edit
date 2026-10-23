@@ -50,6 +50,7 @@ class OverlayPlan:
     fx: str = "fade"  # fade | rise | drift (screenshots in cover mode only)
     fx_dur: float = 0.0  # local duration the motion runs over (drift)
     fit_blur: bool = False  # blurred background + contained image (adaptive)
+    crop_focus: str = "center"  # which third the fill-crop keeps: top/center/bottom
 
 
 def ensure_base(source: Path, plan: EditPlan, workdir: Path, cfg: Config) -> Path:
@@ -135,7 +136,9 @@ def _overlays_for_segment(
             continue
 
         is_shot = v.kind == "screenshot"
-        mode = cfg.visuals.screenshot_mode
+        # Per-visual display override wins over the config default, so the
+        # owner can pin one image to fill/blur/box while others stay adaptive.
+        mode = v.mode or cfg.visuals.screenshot_mode
         W, H = cfg.video.width, cfg.video.height
         reel_ar = W / H
 
@@ -208,9 +211,19 @@ def _overlays_for_segment(
                 fx=fx,
                 fx_dur=in_dur,
                 fit_blur=fit_blur,
+                crop_focus=v.crop_focus or "center",
             )
         )
     return out
+
+
+def _crop_xy(W: int, H: int, focus: str | None) -> str:
+    """Crop window origin after a scale-to-increase: which third is kept."""
+    if focus == "top":
+        return f"(iw-{W})/2:0"
+    if focus == "bottom":
+        return f"(iw-{W})/2:ih-{H}"
+    return f"(iw-{W})/2:(ih-{H})/2"
 
 
 def _filter_for_segment(
@@ -237,10 +250,11 @@ def _filter_for_segment(
             # Keep the whole image visible: blurred, aspect-filled backdrop
             # behind a contained copy, then fade the composite as one unit.
             blur = max(8, min(W, H) // 24)
+            cx, cy = _crop_xy(W, H, ov.crop_focus).split(":")
             parts.append(f"[{k + 1}:v]format=rgba,split[bg{k}][fg{k}]")
             parts.append(
                 f"[bg{k}]scale={W}:{H}:force_original_aspect_ratio=increase:"
-                f"flags=lanczos,crop={W}:{H},gblur=sigma={blur}[bgv{k}]"
+                f"flags=lanczos,crop={W}:{H}:x='{cx}':y='{cy}',gblur=sigma={blur}[bgv{k}]"
             )
             parts.append(
                 f"[fg{k}]scale={W}:{H}:force_original_aspect_ratio=decrease:"
@@ -264,17 +278,20 @@ def _filter_for_segment(
 
         img_parts = [f"[{k + 1}:v]format=rgba"]
         if ov.w == W and ov.h == H and ov.fx in ("fade", "rise", "drift"):
-            # full-frame cover: scale up, center-crop (drift pre-scales larger)
+            # full-frame cover: scale up, crop to the focused third
+            # (drift pre-scales larger)
+            cx, cy = _crop_xy(W, H, ov.crop_focus).split(":")
+            crop = f"crop={W}:{H}:x='{cx}':y='{cy}'"
             if ov.fx == "drift":
                 dw, dh = W + (W // 16 // 2 * 2), H + (H // 16 // 2 * 2)
                 img_parts.append(
                     f"scale={W}:{H}:force_original_aspect_ratio=increase:"
-                    f"flags=lanczos,crop={W}:{H},scale={dw}:{dh}:flags=lanczos"
+                    f"flags=lanczos,{crop},scale={dw}:{dh}:flags=lanczos"
                 )
             else:
                 img_parts.append(
                     f"scale={W}:{H}:force_original_aspect_ratio=increase:"
-                    f"flags=lanczos,crop={W}:{H}"
+                    f"flags=lanczos,{crop}"
                 )
                 dw, dh = W, H
         else:
@@ -345,6 +362,7 @@ def _segment_fingerprint(
                     ov.fx,
                     round(ov.fx_dur, 3),
                     ov.fit_blur,
+                    ov.crop_focus,
                 )
             ).encode()
         )

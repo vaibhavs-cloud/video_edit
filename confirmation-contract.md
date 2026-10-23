@@ -11,16 +11,38 @@ time, so "input or final?" is never ambiguous.
 
 ## Production wiring (infra/worker.mjs + edit.yml)
 
-Free text needs no reply-to and no keywords. The Worker (`CHAT_MODEL =
-llama-3.1-8b-instant` via Groq, `GROQ_API_KEY` secret) classifies each message
-— `chat` (reply directly, no pipeline), `fix`/`adjust` (dispatch dry-run),
-`yes`/`no` (apply/discard pending) — with dialogue memory (`conv:<chat>`,
-last 6 turns, 1h TTL) and the latest delivered state resolved on demand via
-the GitHub artifacts API (latest `state-<sha8>`), so corrections never need
-a reply-to message. Pending confirms live in KV (`pending_confirm:<chat>`,
-30 min). Staging (`done`/`cancel`/URLs/images) is unchanged; without
-`GROQ_API_KEY` the worker keeps legacy behavior (reply-to dispatches
-`kind=fix` immediately, anything else gets usage help).
+Slash commands are deterministic (never the LLM): `/cut`, `/keep`, `/clip`,
+`/place`, `/move`, `/remove`, `/size`, `/recaption`, `/change`, `/preset`
+preview instantly (`kind=fix-dryrun`, exactDK instruction strings, e.g.
+`/size image 3 60%` → `resize image 3 60%`, `/preset punchy` →
+`preset punchy`); `/apply` `/reject` `/redo <sha8>` `/deliver` `/status`
+`/list` `/cancel` manage the conversation; `/new` collects the video (link =
+Drive URL, direct <20MB upload), `/addimage` stages photos (caption time
+optional), `/build` (or plain `done`) starts the run; `/editimage [N]` opens
+an aspect/crop/size menu whose buttons emit exact directives
+(`set_visual_mode image-3 cover crop top`, `resize image-1 to 60%`,
+`preset clean_voice`) parsed by `vedit.stage.fix.parse_directive` with no
+model call. The operator menu is registered lazily via `setMyCommands`
+(runs once, cached in KV for 7 days). `/status` polls the edit.yml runs API
+anchored on the newest dispatch (KV `last_run:<chat>`, 6h).
+
+The talker (`CHAT_MODEL = openai/gpt-oss-20b` via Groq, `GROQ_API_KEY`
+secret) classifies only free text — `chat` (reply directly, no pipeline),
+`fix`/`adjust` (dispatch dry-run), `unknown` — with dialogue memory
+(`conv:<chat>`, last 6 turns, 1h TTL) and the latest delivered state resolved
+on demand via the GitHub artifacts API (latest `state-<sha8>`), so
+corrections never need a reply-to message. Strict yes/no affirmations are
+rule-based ONLY when a preview is pending (`pending_confirm:<chat>`, 30
+min) — small talk can never silently apply an edit; the LLM never decides
+confirmations. Staging (`done`/`cancel`/URLs/images) — dry-run previews
+never consume staging; only `new` runs do. Voice messages are politely
+declined (transcription policy), stickers get a hint to resend as photos.
+Without `GROQ_API_KEY` the worker keeps routing commands and callbacks, and
+free text gets usage help.
+
+Inline keyboard: dry-run confirmations carry `apply:<sha8>` /
+`reject:<sha8>` buttons (callback queries answered on the worker side, then
+dispatch `kind=fix-apply`); the typed yes/no rules still work.
 
 `edit.yml` modes: `new` / `fix` (unchanged) + `fix-dryrun` (dry-run, posts
 the confirmation + tagged frame to Telegram from the workflow, uploads
@@ -28,14 +50,16 @@ the confirmation + tagged frame to Telegram from the workflow, uploads
 `--apply-preview`, delivers as usual). State artifacts are never uploaded by
 dry-run runs.
 
-Redelivery without re-render: `kind=deliver` downloads the latest state
-artifact and runs `vedit deliver` (QC-gated). The talker sends it for resend
-intents ("send it again", "I didn't get the video") with no preview step —
-the file already exists. Delivery failures persist `last_error.txt`, which
-the workflow failure step sends instead of the generic message. Successful
-renders also upload a short-lived `video-<sha8>` artifact (`final.mp4` +
-preview + contact sheet, 7-day retention) so `kind=deliver` downloads the
-video instead of re-rendering; the artifact expires back to "re-run apply".
+Redelivery without re-render: `kind=deliver` downloads the latest video
+artifact (`video-<sha8>`) when it still exists — the file already exists —
+otherwise re-runs `vedit deliver` from the latest state artifact (QC-gated).
+The talker sends it for resend intents ("send it again", "I didn't get the
+video") with no preview step; the rule-based redeliver regex catches typed
+requests too. Delivery failures persist `last_error.txt`, which the workflow
+failure step sends instead of the generic message. Successful renders also
+upload a short-lived `video-<sha8>` artifact (`final.mp4` + preview +
+contact sheet, 7-day retention); the artifact expiring back to "re-run
+apply".
 
 ## Commands (run in the worker sandbox, same `--config`)
 

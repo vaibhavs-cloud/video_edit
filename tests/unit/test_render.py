@@ -143,7 +143,9 @@ def test_cover_filters_execute_in_ffmpeg(tmp_path, cfg, transcript):
         "2",
         str(tmp_path / "o.mp4"),
     ]
-    # 1080p software render: generous budget so loaded machines don't flake.
+    # the point of this test is graph evaluation, not encoding quality:
+    # ultrafast keeps the 1080p encode inside the 300s budget on loaded CI
+    args += ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "30"]
     ff.ffmpeg(args, timeout=300)
     assert (tmp_path / "o.mp4").stat().st_size > 0
 

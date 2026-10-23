@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TypedDict
 
@@ -95,6 +95,35 @@ def _enhance_filter(cfg: Config, measured: LoudnormMeasured | None) -> str:
     elif a.volume_gain_db < 0:
         chain += f",volume={a.volume_gain_db:g}dB"
     return chain
+
+
+def with_preset(cfg: Config, preset_name: str | None) -> Config:
+    """Apply a named audio recipe from ``audio.presets`` in config.yaml.
+
+    Noise cancellation is a hard default: the afftdn stage can never be
+    disabled or weakened by a recipe (afftdn_nf / denoise_reduction_db are
+    protected), so every preset keeps the full clean-voice chain.
+    """
+    if not preset_name:
+        return cfg
+    recipes = cfg.audio.presets or {}
+    if preset_name not in recipes:
+        raise AudioError(
+            f"unknown audio preset '{preset_name}' — have: "
+            + (", ".join(sorted(recipes)) or "none defined in config.yaml")
+        )
+    updates: dict[str, float] = {}
+    for k, v in (recipes[preset_name] or {}).items():
+        if k in ("afftdn_nf", "denoise_reduction_db"):
+            raise AudioError(
+                f"audio preset '{preset_name}' may not change {k} — "
+                "noise cancelling always stays on"
+            )
+        if not hasattr(cfg.audio, k):
+            raise AudioError(f"audio preset '{preset_name}': unknown audio knob '{k}'")
+        updates[k] = v
+    audio = replace(cfg.audio, **updates)
+    return replace(cfg, audio=audio)
 
 
 def prepare(source: Path, workdir: Path, cfg: Config) -> AudioPaths:

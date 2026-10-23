@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 
@@ -59,7 +60,10 @@ SUPPORTED = (
     '("recaption 0:45: ...") · retime a visual ("move the visual at 0:20 to '
     '0:30") · cut a span ("cut 0:30 to 0:45") · keep only a span '
     '("keep only 0:10 to 1:00") · add/remove a zoom ("zoom in at 0:30") · '
-    'resize an overlay ("make the image smaller", "shrink it to 60%"). '
+    'resize an overlay ("make the image smaller", "shrink it to 60%") · '
+    'image display ("make the image 2 fill the reel", "blur-fit image 2", '
+    '"/editimage 2" for the menu) · audio recipe ("/preset clean_voice, '
+    'punchy or flat — noise cancelling is always on"). '
     "Silence cutting is automatic — report surviving pauses and the cut "
     "settings get tuned instead."
 )
@@ -123,6 +127,8 @@ OPS (pick exactly one):
 - add_zoom: emphasis zoom at a moment; set from_word (a named time or phrase maps here). E.g. "zoom in at 0:30".
 - remove_zoom: drop zoom(s) near a time; set from_word + to_word. E.g. "remove the zoom at 0:30".
 - resize_visual: shrink/grow an overlay to a fraction of the frame; set visual_id (or a time naming it) + the size, which is matched exactly by code from explicit percents/words ("60%", "half", "smaller"). E.g. "make the image at 0:58 smaller", "shrink the diagram to 60%", "zoom out the image".
+- set_visual_mode: change HOW an image fills the frame; set visual_id + mode ("cover" = crop to fill the reel, "adaptive" = full image visible on a blurred backdrop, "overlay" = floating smaller box) + optional crop_focus ("top"/"center"/"bottom" for cover). E.g. "make the image 2 fill the reel" -> mode cover, "blur-fit the image" -> mode adaptive, "show the picture as a small floating box" -> mode overlay.
+- set_preset: change the audio recipe; set text = the preset name given by the owner ("clean_voice", "punchy", "flat"). Noise cancelling always stays on. E.g. "use the clean_voice preset".
 - add_visual: place an input image; set file (exactly one of AVAILABLE SCREENSHOTS) + from_word + to_word (source word indices, inside one segment; an explicit time in the instruction is matched exactly to the transcript by code). If the instruction says to add the image without naming one, omit file and the first available screenshot is used. If it names no time or words, omit from_word/to_word and the image goes near the start (it can be retimed after).
 - unknown: the instruction is not about visuals or captions at all
 
@@ -141,6 +147,89 @@ WORDS: {_words_inline(transcript)}
 INSTRUCTION: {instruction}
 
 Answer with raw JSON only, matching the provided schema."""
+
+
+def _visual_by_image(plan: EditPlan, n: int) -> Visual | None:
+    """Screenshot visual whose asset file is ``image-<n>.*`` (bot numbering)."""
+    prefix = f"image-{n}."
+    for v in plan.visuals:
+        if (v.file or "").lower().startswith(prefix):
+            return v
+    return None
+
+
+def _find_visual_ref(plan: EditPlan, ref: str | None) -> Visual:
+    """Resolve a visual by plan id ("v3") or bot image number ("image-3")."""
+    if ref:
+        for v in plan.visuals:
+            if v.id == ref:
+                return v
+        m = re.match(r"(?i)^image-?(\d+)$", str(ref))
+        if m:
+            v = _visual_by_image(plan, int(m.group(1)))
+            if v is not None:
+                return v
+    raise FixError(
+        f"no visual '{ref}' in this plan "
+        f"(have: {', '.join(v.id for v in plan.visuals) or 'none'})"
+    )
+
+
+def parse_directive(instruction: str, plan: EditPlan) -> FixPatch | None:
+    """Machine-readable syntax (slash commands / menus) — parsed without the LLM.
+
+    The worker emits these strings so button presses and /commands map to exact
+    ops; anything that doesn't match falls back to the normal parse path.
+    """
+    t = " ".join((instruction or "").split())
+    m = re.match(r"(?i)^preset\s+([a-z][\w-]{0,30})$", t)
+    if m:
+        return FixPatch(op=FixOp.set_preset, text=m.group(1).lower())
+    m = re.match(
+        r"(?i)^set_visual_mode\s+(\S+)\s+(cover|adaptive|fit|overlay)"
+        r"(?:\s+crop\s+(top|center|bottom))?$",
+        t,
+    )
+    if m:
+        try:
+            v = _find_visual_ref(plan, m.group(1))
+        except FixError:
+            return None  # unknown ref -> let the normal parse path explain
+        mode = "adaptive" if m.group(2).lower() == "fit" else m.group(2).lower()
+        return FixPatch(
+            op=FixOp.set_visual_mode,
+            visual_id=v.id,
+            mode=mode,
+            crop_focus=m.group(3),
+        )
+    m = re.match(r"(?i)^resize\s+image-?(\d+)\s+to\s+(\d{1,3})\s*%$", t)
+    if m:
+        v = _visual_by_image(plan, int(m.group(1)))
+        if v is None:
+            return None
+        return FixPatch(
+            op=FixOp.resize_visual,
+            visual_id=v.id,
+            scale=max(0.2, min(1.0, int(m.group(2)) / 100.0)),
+        )
+    m = re.match(r"(?i)^resize\s+image-?(\d+)\s+(bigger|smaller)$", t)
+    if m:
+        v = _visual_by_image(plan, int(m.group(1)))
+        if v is None:
+            return None
+        scale = (
+            min(1.0, v.scale / 0.8)
+            if m.group(2).lower() == "bigger"
+            else max(0.2, v.scale * 0.8)
+        )
+        return FixPatch(op=FixOp.resize_visual, visual_id=v.id, scale=round(scale, 3))
+    m = re.match(r"(?i)^resize\s+image-?(\d+)\s+full$", t)
+    if m:
+        v = _visual_by_image(plan, int(m.group(1)))
+        if v is None:
+            return None
+        return FixPatch(op=FixOp.resize_visual, visual_id=v.id, scale=1.0)
+    return None
 
 
 def _mock_patch(instruction: str, plan: EditPlan, screenshots: list[str]) -> FixPatch:
@@ -336,6 +425,9 @@ def parse_fix(
     """Map free text to a FixPatch. Raises FixError only when the model fails."""
     shots = screenshots or []
     span_s = cfg.visuals.placement_span_s
+    directive = parse_directive(instruction, plan)
+    if directive is not None:
+        return _apply_time_anchor(directive, instruction, plan, transcript, span_s)
     if mock:
         patch = _mock_patch(instruction, plan, shots)
         return _apply_time_anchor(patch, instruction, plan, transcript, span_s)
@@ -509,6 +601,7 @@ def apply_patch(
     icons_enabled: bool = True,
     screenshots: list[str] | None = None,
     max_zooms: int | None = None,
+    presets: set[str] | None = None,
 ) -> tuple[EditPlan, list[str]]:
     """Deterministically patch the plan. Raises FixError for anything unsafe."""
     notes: list[str] = []
@@ -696,6 +789,35 @@ def apply_patch(
         old, v.scale = v.scale, patch.scale
         notes.append(f"fix: resize_visual {v.id} scale {old:.2f} -> {v.scale:.2f}")
 
+    elif patch.op == FixOp.set_visual_mode:
+        v = _find_visual_ref(plan, patch.visual_id)
+        if v.kind != "screenshot":
+            raise FixError(f"{v.id} is an icon — display modes apply to images only")
+        mode = (patch.mode or "").lower()
+        if not mode or mode == "fit":
+            mode = "adaptive"
+        if mode not in ("cover", "adaptive", "overlay"):
+            raise FixError("display mode must be cover, adaptive (blur fit) or overlay")
+        old = v.mode or "auto"
+        v.mode = mode
+        if patch.crop_focus:
+            v.crop_focus = patch.crop_focus
+        notes.append(
+            f"fix: set_visual_mode {v.id} {old} -> {mode}"
+            + (f", crop {v.crop_focus}" if v.crop_focus else "")
+        )
+
+    elif patch.op == FixOp.set_preset:
+        name = (patch.text or patch.preset or "").strip()
+        if not name:
+            raise FixError("preset needs a name (clean_voice / punchy / flat)")
+        if presets is not None and name not in presets:
+            raise FixError(
+                f"unknown preset '{name}' — have: "
+                + (", ".join(sorted(presets)) or "none defined in config.yaml")
+            )
+        notes.append(f"fix: set_preset '{name}' — re-rendering audio with that recipe")
+
     try:
         validated = EditPlan.model_validate(plan.model_dump())
     except ValidationError as exc:
@@ -745,7 +867,13 @@ def preview_fix(
     sim = plan.model_copy(deep=True)
     try:
         new_plan, notes = apply_patch(
-            patch, sim, transcript, icons_enabled, shots, max_zooms
+            patch,
+            sim,
+            transcript,
+            icons_enabled,
+            shots,
+            max_zooms,
+            presets=set(cfg.audio.presets or {}),
         )
     except FixError as exc:
         return {

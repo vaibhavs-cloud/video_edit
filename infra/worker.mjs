@@ -1,23 +1,46 @@
-// Telegram -> GitHub Actions relay with a GPT-style talker (no structured input needed).
+// Telegram -> GitHub Actions relay with slash commands first, talker second.
 //
 // POST /tg/<TELEGRAM_SECRET_PATH>  (+ X-Telegram-Bot-Api-Secret-Token check)
-//   free text (anything, reply or not) -> talker (Groq gpt-oss-20b) decides:
+//
+// Slash commands (deterministic, never touch the LLM):
+//   /new [link]                            stage the video/link to build from
+//   /addimage                              photo caption hint (label + time)
+//   /build (/done /go)                     dispatch staged video/link + images
+//   /list /status /cancel /help            staging + run polling + wipe + menu
+//   /change <anything>                     dry-run preview, no talker classification
+//   /cut 0:30 0:45 · /keep 0:10 1:00       cut_range / keep_range previews
+//   /place image 3 at 0:20 · /move · /remove · /size image 3 60%
+//   /recaption 0:45 <new text>
+//   /preset clean_voice|punchy|flat        audio recipe (denoise stays on)
+//   /editimage [N]                         image menu: aspect / crop / size
+//   /redo <sha8> · /apply · /reject · /deliver
+//
+// Inline buttons: every dry-run preview carries Apply/Reject buttons
+// (callback_data `apply:<sha8>` / `reject:<sha8>`); /editimage / /preset menus
+// answer callbacks (`menu:<ref>:<vid>:<key>:<value>` / `preset:<name>`) and
+// dispatch previews for the same deterministic pipeline ops.
+//
+// Free text (anything, reply or not) -> talker (Groq gpt-oss-20b) decides:
 //     chat   -> direct reply, no pipeline run
 //     fix    -> dispatch kind=fix-dryrun, preview posted by the workflow,
 //               pending confirm stored in KV; YES -> kind=fix-apply
 //   `done` (or go/process)                -> dispatch staged video/link + images
 //   `cancel`                              -> clear staging (+ pending confirm), dispatch nothing
-//   text containing a URL                 -> stage the link, wait for `done`
-//   photo / image file                   -> stage it (caption = label + time), wait
+//   text containing a URL (nothing staged)-> stage the link, wait for `done`
+//   photo / image file                    -> stage it (caption = label + time), wait
 //   video attachment <= 20 MB             -> stage it, wait for `done`
 //   video attachment > 20 MB              -> reply asking for a Drive link
-// GET /health -> 200
+//
+// Staging images are consumed ONLY by /build: previews and fix runs read them
+// without wiping the list, so a misrouted message can never eat your staging.
 //
 // Talk policy lives here at the edge (fast, ~1 cheap LLM call per message);
 // ALL edit decisions stay in-repo (parse -> dry-run preview -> apply-preview).
 // Staging lives in KV (1h TTL): pending_video:<chat> + pending:<chat>.
 // Dialogue memory: conv:<chat> (last 6 turns, 1h TTL).
 // Pending confirm: pending_confirm:<chat> {state_ref, instruction, ts} (30 min).
+// Edit menu state: edit_menu:<chat> {state_ref, vid, ts} (10 min).
+// Last dispatch: last_run:<chat> {ts, kind, ref, instruction} (6h) — /status.
 // Last delivered video is resolved on demand via the GitHub artifacts API
 // (latest state-<sha8>), so free text never needs a reply-to message.
 // Image captions carry label + placement, e.g. `pyramid at 0:20`,
@@ -27,7 +50,8 @@
 // Secrets (Cloudflare secret_text): TELEGRAM_BOT_TOKEN, TELEGRAM_SECRET_PATH,
 // TELEGRAM_SECRET_TOKEN, GH_TOKEN, ALLOWED_CHAT_ID, GROQ_API_KEY.
 // Without GROQ_API_KEY the bot falls back to legacy behavior (reply-to fix
-// dispatches immediately, anything else gets usage help).
+// dispatches immediately, anything else gets usage help); slash commands keep
+// working either way.
 // Bindings: PENDING_IMAGES (KV namespace "vedit-pending-images").
 
 const GITHUB_API = "https://api.github.com";
@@ -40,6 +64,121 @@ const CONV_TTL = 3600;
 const CONFIRM_TTL = 1800;
 const CONFIRM_STALE_MS = 30 * 60 * 1000;
 const CONV_TURNS = 6;
+const MENU_TTL = 600; // edit_menu / last_run-ish short state
+const CMD_REG_TTL = 604800; // refresh the Telegram command menu weekly
+
+// Telegram bot command menu (set via setMyCommands once per week; typed
+// shortcuts below). Keep descriptions short — they show in the UI.
+const BOT_COMMANDS = [
+  { command: "new", description: "start a new edit — send a link or video next" },
+  { command: "addimage", description: "add images (send photo, caption = label + time)" },
+  { command: "build", description: "join staged video + images, build the cut" },
+  { command: "status", description: "live status of the latest run" },
+  { command: "list", description: "show what's staged right now" },
+  { command: "cancel", description: "clear staging + pending previews" },
+  { command: "change", description: "any edit, previewed first: /change cut the intro" },
+  { command: "cut", description: "remove a span: /cut 0:30 0:45" },
+  { command: "keep", description: "keep only a span: /keep 0:10 1:00" },
+  { command: "place", description: "place an image: /place image 3 at 0:20" },
+  { command: "move", description: "move an image: /move image 3 to 0:40" },
+  { command: "remove", description: "remove an image: /remove image 3" },
+  { command: "size", description: "resize an image: /size image 3 60%" },
+  { command: "recaption", description: "redo captions: /recaption 0:45 better text" },
+  { command: "editimage", description: "image menu: fill/blur/box + crop + size" },
+  { command: "preset", description: "audio recipe: /preset clean_voice" },
+  { command: "apply", description: "confirm the pending preview" },
+  { command: "reject", description: "discard the pending preview" },
+  { command: "deliver", description: "resend the finished video" },
+  { command: "redo", description: "edit a different version: /redo a1b2c3d4" },
+  { command: "help", description: "the full cheat-sheet" },
+];
+
+const HELP_TEXT =
+  "*How to use the bot*\n" +
+  "1. `/new` and send the video (or drive link) — or just send it right away\n" +
+  "2. images: send photos, captions like `pyramid at 0:20`\n" +
+  "3. `/build` → wait → you get the cut + a preview frame\n" +
+  "Edits (every edit is previewed first, then YES/NO buttons):\n" +
+  "`/change cut the intro` · `/cut 0:30 0:45` · `/keep 0:10 1:00`\n" +
+  "`/place image 3 at 0:20` · `/move image 3 to 0:40` · `/remove image 3`\n" +
+  "`/size image 3 60%` · `/recaption 0:45 better text`\n" +
+  "`/editimage 3` → buttons: aspect (fill/blur/box) · crop (top/center/bottom) · size\n" +
+  "`/preset clean_voice|punchy|flat` → audio recipe (noise-cancelling always on)\n" +
+  "`/status` live progress · `/deliver` resend · `/redo a1b2c3d4` switch version\n" +
+  "Typos welcome too — plain text still works, `cancel` always wipes staging.";
+
+// Instruction phrasing per command — matches what the pipeline (LLM parse +
+// deterministic salve) is happiest reading.
+function fixInstruction(cmd, args) {
+  const a = args.replace(/\s+/g, " ").trim();
+  if (cmd === "change") return a;
+  if (cmd === "cut") return a.startsWith("cut") ? a : `cut from ${a}`;
+  if (cmd === "keep" || cmd === "clip") return a.startsWith("keep") ? a : `keep only ${a}`;
+  if (cmd === "place") return a.startsWith("place") ? a : `place ${a}`;
+  if (cmd === "move") return a.startsWith("move") ? a : `move the visual ${a}`;
+  if (cmd === "remove") return a.startsWith("remove") ? a : `remove ${a}`;
+  if (cmd === "size") return a.startsWith("resize") ? a : `resize ${a}`;
+  if (cmd === "recaption") return a.startsWith("recaption") ? a : `recaption ${a}`;
+  if (cmd === "preset") return a.startsWith("preset") ? a : `preset ${a}`;
+  return a;
+}
+
+const CMD_USAGE = new Map([
+  ["cut", "usage: `/cut 0:30 0:45` (or /cut where I say um)"],
+  ["keep", "usage: `/keep 0:10 1:00` — cut everything else"],
+  ["clip", "usage: `/clip 0:10 1:00` — same as /keep"],
+  ["place", "usage: `/place image 3 at 0:20`"],
+  ["move", "usage: `/move image 3 to 0:40`"],
+  ["remove", "usage: `/remove image 3` or `/remove the image at 0:54`"],
+  ["size", "usage: `/size image 3 60%` or `/size image 3 bigger`"],
+  ["recaption", "usage: `/recaption 0:45 your corrected line`"],
+  ["preset", "usage: `/preset clean_voice` (also punchy / flat)"],
+  ["change", "usage: `/change cut the bit where I ramble about pricing`"],
+  ["redo", "usage: `/redo a1b2c3d4` (any earlier state ref)"],
+  ["new", 'usage: `/new https://drive...` — or "/new" then send the video'],
+]);
+
+// Audio recipes the pipeline accepts (`audio.presets` in config.yaml).
+const KNOWN_PRESETS = ["clean_voice", "punchy", "flat"];
+
+// /editimage menu presses → pipeline DIRECTIVE strings, parsed deterministically
+// by vedit.stage.fix.parse_directive (no LLM) — see confirmation-contract.md.
+function menuInstruction(key, value, vid) {
+  if (key === "mode") return `set_visual_mode ${vid} ${value}`;
+  if (key === "crop") return `set_visual_mode ${vid} cover crop ${value}`;
+  if (key === "zoom") {
+    if (value === "bigger") return `resize ${vid} bigger`;
+    if (value === "full") return `resize ${vid} full`;
+    if (value.startsWith("m")) return `resize ${vid} to ${value.slice(1)}%`;
+    return `resize ${vid} to ${value}`;
+  }
+  return value;
+}
+
+// Rule-based affirmations ONLY fire when a preview is pending (so "yes" in
+// small talk never applies an edit silently). Rejections likewise.
+const STRICT_YES_RE =
+  /^(y+e+s+h?|yes sir|yeah+|yup|ya?s+|sure|ok(ay)?|fine|go( ahead)?|do it|confirm(ed)?|apply( it)?|ship it|lgtm|this one|do this|perfect|great|good|please( do)?)\s*[.!]*$/i;
+const STRICT_NO_RE =
+  /^(no+p?|nope|nah|don'?t|dont do( it)?|reject( it)?|scrap|cancel( it)?|nevermind|never mind|stop|abort)\s*[.!]*$/i;
+const REDELIVER_RE =
+  /^(resend|redeliver|send (it|the video) again|send (me )?the video|send (me )?the file|i (don'?t|did'?t) (get|receive))\b/i;
+
+const CALLBACK_LIMIT = 64; // Telegram callback_data max bytes
+
+// Commands that turn into a previewed edit (dry-run dispatch).
+const FIX_CMDS = new Set([
+  "change",
+  "cut",
+  "keep",
+  "clip",
+  "place",
+  "move",
+  "remove",
+  "size",
+  "recaption",
+  "preset",
+]);
 
 export default {
   async fetch(request, env) {
@@ -83,6 +222,12 @@ export default {
 };
 
 async function handleUpdate(update, env) {
+  // Inline keyboard presses: apply / reject previews and /editimage menus are
+  // fully deterministic — they never touch the talker.
+  if (update.callback_query) {
+    await handleCallback(update.callback_query, env);
+    return;
+  }
   const msg = update.message || update.edited_message || update.channel_post;
   if (!msg) return;
 
@@ -97,6 +242,15 @@ async function handleUpdate(update, env) {
   }
 
   const text = (msg.text || msg.caption || "").trim();
+  if (text) await ensureBotCommands(env);
+
+  // Typing a slash command is a hard contract: route it deterministically,
+  // before reply logic, staging or the talker get any say.
+  if (msg.text && text.startsWith("/")) {
+    await routeCommand(env, msg, chatId);
+    return;
+  }
+
   const hasMedia = Boolean(msg.video || msg.photo || msg.document);
 
   // 1) reply context: a state ref becomes a hint for the talker, not a dispatch.
@@ -113,7 +267,7 @@ async function handleUpdate(update, env) {
         await sendText(
           env,
           chatId,
-          'send the correction as text, e.g. "place image 1 at 0:20"',
+          'send the correction as text — e.g. "place image 1 at 0:20", or use /editimage',
         );
         return;
       }
@@ -124,7 +278,7 @@ async function handleUpdate(update, env) {
           state_ref: stateRef[0],
           instruction: text,
           attachments: JSON.stringify(
-            (await takePending(env, chatId)).map((im) => im.id),
+            (await peekPending(env, chatId)).map((im) => im.id),
           ),
         });
         await sendText(env, chatId, `queued fix ${stateRef[0]} — new cut coming`);
@@ -145,7 +299,7 @@ async function handleUpdate(update, env) {
     }
   }
 
-  // 2) staging commands (plain text only — never a reply/caption/media).
+  // 2) staging: `done`/`go` words build when nothing else is pending.
   // A pending confirm reroutes `done`-words to the talker (likely "confirm").
   const cmd = text.toLowerCase();
   if (!reply && !hasMedia) {
@@ -163,43 +317,23 @@ async function handleUpdate(update, env) {
       return;
     }
     if (DONE_WORDS.has(cmd) && !pending) {
-      const video = await getVideo(env, chatId);
-      if (!video) {
-        const staged = await getPending(env, chatId);
-        await sendText(
-          env,
-          chatId,
-          staged.length
-            ? `no video staged yet — ${staged.length} image(s) waiting. Send the video or link first (or reply to a delivered video to add them to it).`
-            : "nothing staged yet — send a video or link first, then images, then `done`.",
-        );
-        return;
-      }
-      const imgs = await takePending(env, chatId);
-      await clearVideo(env, chatId);
-      const inputs = {
-        kind: "new",
-        chat_id: chatId,
-        prompt: buildPrompt(video.prompt, imgs),
-        attachments: JSON.stringify(imgs.map((im) => im.id)),
-      };
-      if (video.kind === "url") inputs.url = video.ref;
-      else inputs.video_file_id = video.ref;
-      await dispatch(env, inputs);
-      await sendText(
-        env,
-        chatId,
-        imgs.length
-          ? `queued — building v1 from your video + ${imgs.length} image(s)`
-          : "queued — processing your video now",
-      );
+      await buildCommand(env, chatId, "done");
       return;
     }
   }
 
-  // 3) URL in text -> stage the link, wait for `done`
+  // 3) URL in text -> stage the link, wait for `done`. Never silently
+  // overwrite an already-staged video: a "check this link" aside would lose it.
   const urlMatch = text.match(/https?:\/\/\S+/);
   if (urlMatch && !msg.video) {
+    if (await getVideo(env, chatId)) {
+      await sendText(
+        env,
+        chatId,
+        "a video is already staged — send 'cancel' first, or use '/new <link>' to replace it.",
+      );
+      return;
+    }
     const prompt = text.replace(urlMatch[0], "").trim();
     await setVideo(env, chatId, { kind: "url", ref: urlMatch[0], prompt });
     const staged = await getPending(env, chatId);
@@ -207,7 +341,7 @@ async function handleUpdate(update, env) {
       env,
       chatId,
       `link received — ${staged.length} image(s) already staged. ` +
-        "Send images with captions (`name at 0:20`), then `done` and I'll build v1. Nothing runs until then.",
+        "Send images with captions (`name at 0:20`), then 'done' and I'll build v1. Nothing runs until then.",
     );
     return;
   }
@@ -221,7 +355,12 @@ async function handleUpdate(update, env) {
       : null;
   const image = photo || imageDoc;
   if (image && !msg.video) {
-    const note = (msg.caption || "").trim();
+    // A caption may carry the command word ("/addimage pyramid at 0:20") —
+    // the label is what follows, so strip one leading slash token.
+    let note = (msg.caption || "").trim();
+    if (note.startsWith("/")) {
+      note = note.replace(/^\/[a-z_]+(?:@\S+)?/i, "").trim();
+    }
     const count = await pushPending(env, chatId, image.file_id, note);
     const stagedVideo = await getVideo(env, chatId);
     const capUrl = note.match(/https?:\/\/\S+/);
@@ -242,8 +381,8 @@ async function handleUpdate(update, env) {
       chatId,
       `saved image ${count}${echo} — ` +
         (stagedVideo || capUrl
-          ? "send more, then `done` and I'll build v1."
-          : "now send the video (or link), then `done`."),
+          ? "send more, then 'done' and I'll build v1."
+          : "now send the video (or link), then 'done'."),
     );
     return;
   }
@@ -272,21 +411,35 @@ async function handleUpdate(update, env) {
       env,
       chatId,
       `video received — ${staged.length} image(s) already staged. ` +
-        "Send images with captions (`name at 0:20`), then `done` and I'll build v1. Nothing runs until then.",
+        "Send images with captions (`name at 0:20`), then 'done' and I'll build v1. Nothing runs until then.",
     );
     return;
   }
 
-  // 6) free text -> GPT-style talker turn (no structured input needed).
+  // 6) anything else that carries no text (voice notes, stickers, audio files)
+  // can't be scheduled — say what IS supported instead of routing an empty
+  // message into the talker.
+  if (!text) {
+    const kind =
+      msg.voice ? "voice messages"
+      : msg.audio ? "audio files"
+      : msg.sticker ? "stickers"
+      : msg.video_note ? "video notes"
+      : null;
+    if (kind) {
+      await sendText(
+        env,
+        chatId,
+        `${kind} aren't supported — type the edit as text, or use the slash commands (/help).`,
+      );
+      return;
+    }
+  }
+
+  // 7) free text -> GPT-style talker turn (no structured input needed).
   // Legacy path (no GROQ_API_KEY): usage help.
   if (!env.GROQ_API_KEY) {
-    await sendText(
-      env,
-      chatId,
-      "send a video or link (it waits here), then images with captions " +
-        "(`pyramid at 0:20`), then `done` — v1 builds once, with everything placed. " +
-        "Reply to a delivered video to correct it; `cancel` clears staging.",
-    );
+    await sendText(env, chatId, HELP_TEXT);
     return;
   }
   await chatTurn(env, chatId, { text, replyRef, pending });
@@ -294,7 +447,34 @@ async function handleUpdate(update, env) {
 
 // One conversational turn: talker decides chat / fix / yes / no / adjust.
 // Edit decisions always go through dry-run preview + explicit YES.
+// Hard cases (a pending YES/NO with an unambiguous answer) are decided by
+// rules BEFORE the talker — the model never gets to misread "yess" again.
 async function chatTurn(env, chatId, { text, replyRef, pending }) {
+  if (pending && STRICT_YES_RE.test(text)) {
+    await clearPendingConfirm(env, chatId);
+    await sendText(
+      env,
+      chatId,
+      "Applying now — new cut lands here in a few minutes.",
+    );
+    await dispatch(env, {
+      kind: "fix-apply",
+      chat_id: chatId,
+      state_ref: pending.state_ref,
+      instruction: "",
+    });
+    return;
+  }
+  if (pending && STRICT_NO_RE.test(text)) {
+    await clearPendingConfirm(env, chatId);
+    await sendText(env, chatId, "discarded — nothing was applied.");
+    return;
+  }
+  if (REDELIVER_RE.test(text)) {
+    const ref = await getLatestStateRef(env);
+    await deliverRef(env, chatId, ref);
+    return;
+  }
   const turns = await getConv(env, chatId);
   const staged = await getPending(env, chatId);
   const video = await getVideo(env, chatId);
@@ -315,7 +495,7 @@ async function chatTurn(env, chatId, { text, replyRef, pending }) {
       talk.action === "fix" || talk.action === "adjust"
         ? "On it — previewing that now, one sec."
         : talk.action === "yes"
-          ? "Applying now."
+          ? "Applying now — new cut lands here in a few minutes."
           : "Got it.";
   }
   if (talk.reply) await sendText(env, chatId, talk.reply);
@@ -323,45 +503,12 @@ async function chatTurn(env, chatId, { text, replyRef, pending }) {
   if (talk.action === "fix" || talk.action === "adjust") {
     const ref = talk.state_ref || replyRef || pending?.state_ref || lastState;
     const instruction = talk.instruction || text;
-    if (!ref) {
-      await sendText(
-        env,
-        chatId,
-        "which video should I change? Reply to a delivered video and tell me the edit.",
-      );
-      return;
-    }
-    await setPendingConfirm(env, chatId, {
-      state_ref: ref,
-      instruction,
-      op: talk.action,
-      ts: Date.now(),
-    });
-    await dispatch(env, {
-      kind: "fix-dryrun",
-      chat_id: chatId,
-      state_ref: ref,
-      instruction,
-      attachments: JSON.stringify((await takePending(env, chatId)).map((im) => im.id)),
-    });
+    await previewFix(env, chatId, instruction, ref);
     return;
   }
   if (talk.action === "deliver") {
     const ref = talk.state_ref || replyRef || lastState;
-    if (!ref) {
-      await sendText(
-        env,
-        chatId,
-        "which video should I send? Reply to a delivered video.",
-      );
-      return;
-    }
-    await dispatch(env, {
-      kind: "deliver",
-      chat_id: chatId,
-      state_ref: ref,
-      instruction: "",
-    });
+    await deliverRef(env, chatId, ref);
     return;
   }
   if (talk.action === "yes") {
@@ -387,6 +534,538 @@ async function chatTurn(env, chatId, { text, replyRef, pending }) {
     return; // ack already sent as the reply
   }
   // chat / unknown: reply already sent, nothing to dispatch.
+}
+
+// ---- slash commands: deterministic routing, zero talker involvement ----
+
+function parseCommand(text) {
+  const m = String(text).match(/^\/([a-z_]+)(?:@[\w]+)?(\s+[\s\S]*|\s*)?$/i);
+  if (!m) return null;
+  return { cmd: m[1].toLowerCase(), args: (m[2] || "").trim().replace(/^\/[a-z_]+(.*)$/i, "$1").trim() };
+}
+
+async function routeCommand(env, msg, chatId) {
+  const parsed = parseCommand((msg.text || "").trim());
+  if (!parsed) return; // not a well-formed command — fall through as text
+  const { cmd, args } = parsed;
+  const pending = await getPendingConfirm(env, chatId);
+
+  switch (cmd) {
+    case "help":
+    case "start":
+      await sendText(env, chatId, HELP_TEXT);
+      return;
+    case "list": {
+      const imgs = await getPending(env, chatId);
+      const video = await getVideo(env, chatId);
+      const lines = imgs.map((im, i) => {
+        const p = parsePlacement(im.note || "", `image ${i + 1}`);
+        const t =
+          p.start == null
+            ? ""
+            : ` · ${p.end == null ? "from " + fmtTime(p.start) : fmtTime(p.start) + "–" + fmtTime(p.end)}`;
+        return `• ${p.label}${t}`;
+      });
+      await sendText(
+        env,
+        chatId,
+        (video ? `video: staged (${video.kind === "url" ? "link" : "file"})\n` : "video: none staged\n") +
+          (lines.length ? lines.join("\n") : "no images staged — send photos or /addimage"),
+      );
+      return;
+    }
+    case "status":
+      await runStatus(env, chatId);
+      return;
+    case "cancel":
+      await clearPendingConfirm(env, chatId);
+      await takePending(env, chatId);
+      await clearVideo(env, chatId);
+      await sendText(
+        env,
+        chatId,
+        (pending ? "edit scrapped and " : "") + "staging cleared. Send a video when ready.",
+      );
+      return;
+    case "new": {
+      const url = args.match(/https?:\/\/\S+/);
+      if (url) {
+        await setVideo(env, chatId, {
+          kind: "url",
+          ref: url[0],
+          prompt: args.replace(url[0], "").trim(),
+        });
+        await sendText(
+          env,
+          chatId,
+          "link staged — send images with captions if you want them, then 'done' (or /build).",
+        );
+        return;
+      }
+      if (args) {
+        await sendText(env, chatId, CMD_USAGE.get("new"));
+        return;
+      }
+      await sendText(env, chatId, "send the video (<= 20MB) or a Drive link now — I'll stage it.");
+      return;
+    }
+    case "addimage":
+      await sendText(
+        env,
+        chatId,
+        "send the photo(s) now — captions carry the label + time, e.g. `pyramid at 0:20`.",
+      );
+      return;
+    case "build":
+    case "done":
+    case "go":
+      await buildCommand(env, chatId, cmd);
+      return;
+    case "apply": {
+      if (!pending) {
+        await sendText(env, chatId, "nothing waiting for approval — nothing applied.");
+        return;
+      }
+      await clearPendingConfirm(env, chatId);
+      await sendText(env, chatId, "Applying now — new cut lands here in a few minutes.");
+      await dispatch(env, {
+        kind: "fix-apply",
+        chat_id: chatId,
+        state_ref: pending.state_ref,
+        instruction: "",
+      });
+      return;
+    }
+    case "reject": {
+      if (pending) await clearPendingConfirm(env, chatId);
+      await sendText(env, chatId, "discarded — nothing was applied.");
+      return;
+    }
+    case "deliver":
+      await deliverRef(env, chatId, args.match(/\b[0-9a-f]{8}\b/)?.[0] || null);
+      return;
+    case "redo": {
+      const ref = args.match(/\b[0-9a-f]{8}\b/)?.[0];
+      if (!ref) {
+        await sendText(env, chatId, CMD_USAGE.get("redo"));
+        return;
+      }
+      await setPendingConfirm(env, chatId, {
+        state_ref: ref,
+        instruction: "",
+        op: "fix",
+        ts: Date.now(),
+      });
+      await sendText(env, chatId, `target set to ${ref} — what should I change? (or /editimage)`);
+      return;
+    }
+    case "editimage": {
+      const n = args.match(/\d+/);
+      const ref =
+        String(msg.reply_to_message?.text || "")
+          .match(/\b[0-9a-f]{8}\b/)?.[0] || null;
+      await editImageMenu(env, chatId, ref, n ? `image-${n[0]}` : null);
+      return;
+    }
+    case "preset": {
+      const name = args.trim().toLowerCase();
+      if (!name) {
+        if (KNOWN_PRESETS.length) {
+          const rows = KNOWN_PRESETS.map((p) => [
+            { text: p, callback_data: `preset:${p}` },
+          ]);
+          await sendText(env, chatId, "pick the audio recipe:", { inline_keyboard: rows });
+          return;
+        }
+        await sendText(env, chatId, CMD_USAGE.get("preset"));
+        return;
+      }
+      await previewFix(env, chatId, fixInstruction("preset", name), null);
+      return;
+    }
+    default: {
+      const instruction = fixInstruction(cmd, args);
+      const valid = FIX_CMDS.has(cmd);
+      if (!valid) {
+        await sendText(env, chatId, `unknown command '/${cmd}' — here's the menu:` + "\n" + HELP_TEXT);
+        return;
+      }
+      if (!args) {
+        await sendText(env, chatId, CMD_USAGE.get(cmd) || "what should I do?");
+        return;
+      }
+      await previewFix(
+        env,
+        chatId,
+        instruction,
+        String(msg.reply_to_message?.text || "").match(/\b[0-9a-f]{8}\b/)?.[0] ||
+          pending?.state_ref ||
+          null, // previewFix falls back to the newest state itself
+      );
+    }
+  }
+}
+
+// Build from staged video + images: the only path that consumes staging.
+async function buildCommand(env, chatId, source) {
+  const video = await getVideo(env, chatId);
+  if (!video) {
+    const staged = await getPending(env, chatId);
+    const known =
+      source === "build" ? "/build" : `'${source}'`;
+    await sendText(
+      env,
+      chatId,
+      staged.length
+        ? `no video staged yet — ${staged.length} image(s) waiting. Send the video or a link first.`
+        : `nothing staged — send a video or link (or '/new <link>'), then ${known}.`,
+    );
+    return;
+  }
+  const imgs = await takePending(env, chatId);
+  await clearVideo(env, chatId);
+  const inputs = {
+    kind: "new",
+    chat_id: chatId,
+    prompt: buildPrompt(video.prompt, imgs),
+    attachments: JSON.stringify(imgs.map((im) => im.id)),
+  };
+  if (video.kind === "url") inputs.url = video.ref;
+  else inputs.video_file_id = video.ref;
+  await dispatch(env, inputs);
+  await sendText(
+    env,
+    chatId,
+    imgs.length
+      ? `queued — building v1 from your video + ${imgs.length} image(s). /status for progress.`
+      : "queued — processing your video now. /status for progress.",
+  );
+}
+
+// Read-only look at staged images (previews must never eat staging).
+async function peekPending(env, chatId) {
+  return getPending(env, chatId);
+}
+
+// Resolve a state ref (explicit > reply > pending > newest), store the pending
+// confirm and dispatch the dry-run. Staging images stay in KV.
+async function previewFix(env, chatId, instruction, refHint, { silent } = {}) {
+  const pending = await getPendingConfirm(env, chatId);
+  let ref = refHint || null;
+  if (!ref) ref = (await getLatestStateRef(env)) || null;
+  if (!ref) {
+    await sendText(
+      env,
+      chatId,
+      "no video to edit yet — build one first (send a video, then 'done').",
+    );
+    return;
+  }
+  const samePending =
+    pending &&
+    pending.state_ref === ref &&
+    pending.instruction === instruction;
+  if (!samePending) {
+    await setPendingConfirm(env, chatId, {
+      state_ref: ref,
+      instruction,
+      op: "fix",
+      ts: Date.now(),
+    });
+  }
+  await dispatch(env, {
+    kind: "fix-dryrun",
+    chat_id: chatId,
+    state_ref: ref,
+    instruction,
+    attachments: JSON.stringify((await peekPending(env, chatId)).map((im) => im.id)),
+  });
+  if (!silent) {
+    await sendText(
+      env,
+      chatId,
+      `previewing: “${instruction.slice(0, 120)}” — frame + summary arrive in about a minute, then YES/NO buttons.`,
+    );
+  }
+}
+
+async function deliverRef(env, chatId, refHint) {
+  let ref = refHint;
+  if (!ref) ref = (await getLatestStateRef(env)) || null;
+  if (!ref) {
+    await sendText(env, chatId, "no delivered video yet to resend.");
+    return;
+  }
+  await dispatch(env, {
+    kind: "deliver",
+    chat_id: chatId,
+    state_ref: ref,
+    instruction: "",
+  });
+  await sendText(env, chatId, `resending ${ref} — check your media in a jiffy.`);
+}
+
+// ---- inline keyboards: confirm + /editimage + /preset menus ----
+
+async function handleCallback(cb, env) {
+  const chatId = String(cb.message?.chat?.id ?? cb.from?.id ?? "");
+  if (chatId !== String(env.ALLOWED_CHAT_ID)) {
+    await answerCallback(env, cb.id, "not for this chat");
+    return;
+  }
+  const data = String(cb.data || "").slice(0, CALLBACK_LIMIT);
+  const parts = data.split(":");
+  const [tag] = parts;
+
+  if (tag === "apply" && parts.length === 2) {
+    const ref = parts[1];
+    const pending = await getPendingConfirm(env, chatId);
+    if (!pending || pending.state_ref !== ref) {
+      await answerCallback(env, cb.id, "that preview expired — make the edit again");
+      return;
+    }
+    await clearPendingConfirm(env, chatId);
+    await answerCallback(env, cb.id, "Applying — new cut in a few minutes");
+    await sendText(env, chatId, "Applying now — new cut lands here in a few minutes.");
+    await dispatch(env, {
+      kind: "fix-apply",
+      chat_id: chatId,
+      state_ref: ref,
+      instruction: "",
+    });
+    return;
+  }
+  if (tag === "reject" && parts.length === 2) {
+    const ref = parts[1];
+    const pending = await getPendingConfirm(env, chatId);
+    if (pending && pending.state_ref === ref) await clearPendingConfirm(env, chatId);
+    await answerCallback(env, cb.id, "discarded");
+    return;
+  }
+  if (tag === "preset" && parts.length === 2 && KNOWN_PRESETS.includes(parts[1])) {
+    await answerCallback(env, cb.id, "Previewing the audio recipe…");
+    await previewFix(env, chatId, `preset ${parts[1]}`, null, { silent: true });
+    return;
+  }
+  if (tag === "edil" && parts.length === 3) {
+    // image picked -> show the aspect/crop/size grid for that image
+    await setEditMenu(env, chatId, { state_ref: parts[1], vid: parts[2], ts: Date.now() });
+    await answerCallback(env, cb.id, "pick an aspect");
+    await sendMenuButtons(env, chatId, parts[2]);
+    return;
+  }
+  if (tag === "menu" && parts.length === 5) {
+    const [, ref, vid, key, value] = parts;
+    await answerCallback(env, cb.id, "Previewing…");
+    await previewFix(env, chatId, menuInstruction(key, value, vid), ref, { silent: true });
+    return;
+  }
+  await answerCallback(env, cb.id, "unknown action");
+}
+
+const MODE_GRID = [
+  [
+    { text: "▶ Fill reel", callback_data: "mode:cover" },
+    { text: "🌤 Fit + blur", callback_data: "mode:adaptive" },
+    { text: "▢ Floating box", callback_data: "mode:overlay" },
+  ],
+];
+
+const CROP_GRID = [
+  [
+    { text: "⬆ top", callback_data: "crop:top" },
+    { text: "⏺ center", callback_data: "crop:center" },
+    { text: "⬇ bottom", callback_data: "crop:bottom" },
+  ],
+];
+
+const SIZE_GRID = [
+  [
+    { text: "+ Tighter", callback_data: "zoom:bigger" },
+    { text: "− Wider", callback_data: "zoom:m60" },
+    { text: "▣ Full", callback_data: "zoom:full" },
+  ],
+  [
+    { text: "50%", callback_data: "zoom:m50" },
+    { text: "60%", callback_data: "zoom:m60" },
+    { text: "80%", callback_data: "zoom:m80" },
+  ],
+];
+
+function menuButtons(stateRef, vid) {
+  const fill = (grid) =>
+    grid.map((row) =>
+      row.map((b) => ({
+        text: b.text,
+        callback_data: `menu:${stateRef}:${vid}:${b.callback_data}`,
+      })),
+    );
+  return {
+    inline_keyboard: [
+      ...fill(MODE_GRID),
+      ...fill(CROP_GRID),
+      ...fill(SIZE_GRID),
+    ],
+  };
+}
+
+async function sendMenuButtons(env, chatId, vid) {
+  const ref = (await getLatestStateRef(env)) || null;
+  if (!ref) {
+    await sendText(env, chatId, "no delivered video yet — /editimage works after the first cut.");
+    return;
+  }
+  await sendText(
+    env,
+    chatId,
+    `image ${vid} — aspect, then crop (fill modes), then size:`,
+    menuButtons(ref, vid),
+  );
+}
+
+async function editImageMenu(env, chatId, ref, vid) {
+  const stateRef = ref || (await getLatestStateRef(env)) || null;
+  if (!stateRef) {
+    await sendText(env, chatId, "no delivered video yet — /editimage works after the first cut.");
+    return;
+  }
+  if (vid) {
+    await setEditMenu(env, chatId, { state_ref: stateRef, vid, ts: Date.now() });
+    await sendText(env, chatId, `image ${vid} — aspect, crop, size:`, menuButtons(stateRef, vid));
+    return;
+  }
+  const rows = [];
+  for (let i = 1; i <= 9; i += 3) {
+    rows.push(
+      [i, i + 1, i + 2].map((n) => ({
+        text: `image ${n}`,
+        callback_data: `edil:${stateRef}:image-${n}`,
+      })),
+    );
+  }
+  await sendText(env, chatId, "which image?", { inline_keyboard: rows });
+}
+
+async function setEditMenu(env, chatId, menu) {
+  try {
+    if (env.PENDING_IMAGES) {
+      await env.PENDING_IMAGES.put(`edit_menu:${chatId}`, JSON.stringify(menu), {
+        expirationTtl: MENU_TTL,
+      });
+    }
+  } catch {
+    // best-effort: menus are shortcuts, the typed commands always work
+  }
+}
+
+async function getEditMenu(env, chatId) {
+  try {
+    if (!env.PENDING_IMAGES) return null;
+    const raw = await env.PENDING_IMAGES.get(`edit_menu:${chatId}`);
+    const m = raw ? JSON.parse(raw) : null;
+    return m && m.state_ref && m.vid ? m : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---- /status: is the workflow actually doing anything? ----
+// Latest dispatch is recorded per chat (last_run:<chat>); the newest matching
+// GitHub Actions run for edit.yml answers queued / running / verdict.
+
+async function runStatus(env, chatId) {
+  try {
+    let last = null;
+    try {
+      if (env.PENDING_IMAGES) {
+        const raw = await env.PENDING_IMAGES.get(`last_run:${chatId}`);
+        last = raw ? JSON.parse(raw) : null;
+      }
+    } catch {
+      last = null;
+    }
+    if (!last) {
+      await sendText(env, chatId, "no runs yet — send a video or a link, then 'done'.");
+      return;
+    }
+    const resp = await fetch(
+      `${GITHUB_API}/repos/${env.GH_OWNER}/${env.GH_REPO}/actions/workflows/edit.yml/runs?per_page=6`,
+      {
+        headers: {
+          Authorization: `Bearer ${env.GH_TOKEN}`,
+          Accept: "application/vnd.github+json",
+          "User-Agent": "vedit-relay",
+        },
+      },
+    );
+    if (!resp.ok) throw new Error(`github runs ${resp.status}`);
+    const data = await resp.json();
+    const runs = Array.isArray(data?.workflow_runs) ? data.workflow_runs : [];
+    const dispatchMs = Number(last.ts || 0);
+    const run = runs.find(
+      (r) => new Date(r.created_at || 0).getTime() >= dispatchMs - 20000,
+    );
+    const mins = Math.max(1, Math.round((Date.now() - dispatchMs) / 60000));
+    const kind =
+      last.kind === "new" ? "build"
+      : last.kind === "fix-dryrun" ? "preview"
+      : last.kind === "fix-apply" ? "apply"
+      : last.kind;
+    if (!run) {
+      await sendText(
+        env,
+        chatId,
+        `dispatched ${mins} min ago — still waiting for a runner (GitHub queueing).`,
+      );
+      return;
+    }
+    const age = Math.round((Date.now() - new Date(run.created_at).getTime()) / 60000);
+    if (run.status !== "completed") {
+      await sendText(
+        env,
+        chatId,
+        `${kind} is running — started ${age} min ago (GitHub status: ${run.status}).`,
+      );
+      return;
+    }
+    const ok = run.conclusion === "success";
+    await sendText(
+      env,
+      chatId,
+      `${kind} ${ok ? "finished ✓" : `stopped (${run.conclusion})`} ${age} min ago` +
+        `${last.ref ? ` — state ${last.ref}` : ""}. ` +
+        (ok
+          ? "the result should be in the chat above."
+          : "no video was produced — you can retry the same command."),
+    );
+  } catch (err) {
+    await sendText(
+      env,
+      chatId,
+      `status check failed: ${String(err?.message || err).slice(0, 200)}`,
+    );
+  }
+}
+
+// ---- register the Telegram command menu once per week ----
+
+async function ensureBotCommands(env) {
+  try {
+    if (!env.PENDING_IMAGES) return;
+    if (await env.PENDING_IMAGES.get("botcmd:v2")) return;
+    const resp = await fetch(
+      `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setMyCommands`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ commands: BOT_COMMANDS }),
+      },
+    );
+    if (!resp.ok) return; // retry on a later message; errors stay silent
+    await env.PENDING_IMAGES.put("botcmd:v2", "1", { expirationTtl: CMD_REG_TTL });
+  } catch {
+    // menu registration is conveniences-only
+  }
 }
 
 // Staged input images, buffered in KV between messages (1h TTL).
@@ -804,23 +1483,56 @@ async function dispatch(env, inputs) {
         "Content-Type": "application/json",
         "User-Agent": "vedit-relay", // GitHub API rejects requests without one
       },
-      body: JSON.stringify({ ref: "main", inputs: normalizedInputs(inputs) }),
-    },
+  body: JSON.stringify({ ref: "main", inputs: normalizedInputs(inputs) }),
+  },
   );
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
     throw new Error(`github dispatch ${resp.status}: ${body.slice(0, 200)}`);
   }
+  // /status anchors: remember what we queued and when.
+  try {
+    if (env.PENDING_IMAGES && inputs.chat_id) {
+      await env.PENDING_IMAGES.put(
+        `last_run:${inputs.chat_id}`,
+        JSON.stringify({
+          ts: Date.now(),
+          kind: String(inputs.kind || ""),
+          ref: String(inputs.state_ref || ""),
+          instruction: String(inputs.instruction || inputs.prompt || "").slice(0, 80),
+        }),
+        { expirationTtl: 21600 },
+      );
+    }
+  } catch {
+    // best-effort
+  }
 }
 
-async function sendText(env, chatId, text) {
+async function sendText(env, chatId, text, markup) {
+  const payload = { chat_id: chatId, text: text.slice(0, 4000) };
+  if (markup) payload.reply_markup = markup;
   const resp = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text: text.slice(0, 4000) }),
+    body: JSON.stringify(payload),
   });
   if (!resp.ok) {
     const body = await resp.text().catch(() => "");
     throw new Error(`telegram sendMessage ${resp.status}: ${body.slice(0, 200)}`);
+  }
+}
+
+async function answerCallback(env, cbId, text) {
+  const resp = await fetch(
+    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/answerCallbackQuery`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ callback_query_id: cbId, text: String(text || "").slice(0, 190) }),
+    },
+  );
+  if (!resp.ok) {
+    // a missed answer just leaves the button spinner; worth no retry loop
   }
 }

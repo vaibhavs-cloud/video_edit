@@ -131,6 +131,8 @@ class S3Cfg:
     region: str
     expires_h: int
     teaser: str  # video | document | none
+    notify_gb: float  # Telegram nudge when bucket usage crosses this
+    evict_gb: float  # start deleting least-recently-modified at this level
 
 
 @dataclass(frozen=True)

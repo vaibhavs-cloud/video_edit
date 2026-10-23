@@ -459,6 +459,36 @@ def _run_stages(ctx: Ctx, start: str = "acquire") -> None:
             st.run_stage(ctx.state, name, lambda fn=fn: fn(ctx))
 
 
+def _budget_report(ctx: Ctx, tg) -> None:
+    """Post-delivery storage budget pass: nudge at notify_gb, evict at evict_gb."""
+    from vedit.stage.export import maintenance
+
+    s3 = ctx.cfg.export.s3
+    if not s3.enabled:
+        return
+    try:
+        total, deleted = maintenance(ctx.cfg)
+    except Exception as exc:  # noqa: BLE001 — budget hygiene must not break delivery
+        _log(f"[deliver] budget check failed: {exc}")
+        return
+    used = total / (1 << 30)
+    if deleted:
+        keys = ", ".join(deleted[-3:]) + (" …" if len(deleted) > 3 else "")
+        tg.send_message(
+            ctx.chat_id,
+            f"storage was over {s3.evict_gb}GB — trimmed to {used:.1f}GB "
+            f"(deleted {len(deleted)} oldest exports: {keys})",
+        )
+        _log(f"[deliver] budget evicted {len(deleted)} files, total now {total}B")
+    elif used >= s3.notify_gb:
+        tg.send_message(
+            ctx.chat_id,
+            f"storage at {used:.1f}GB / 10GB free tier — oldest exports get "
+            f"deleted automatically above {s3.evict_gb}GB",
+        )
+        _log(f"[deliver] budget notice at {total}B")
+
+
 def _deliver(ctx: Ctx) -> None:
     from vedit.stage.export import upload_and_presign
     from vedit.telegram_client import Telegram
@@ -496,11 +526,13 @@ def _deliver(ctx: Ctx) -> None:
             tg.send_video(ctx.chat_id, final, caption + " · full quality at link")
             _log(f"[deliver] teaser sent ({size / 1e6:.1f}MB) + r2 link")
         tg.send_message(ctx.chat_id, f"full quality (no re-encode): {link}")
-        _log(f"[deliver] r2 link sent ({size / 1e6:.1f}MB)")
+        _log(f"[deliver] link sent ({size / 1e6:.1f}MB)")
+        _budget_report(ctx, tg)
         return
     if fits_telegram:
         tg.send_video(ctx.chat_id, final, caption)
         _log(f"[deliver] final.mp4 sent ({size / 1e6:.1f}MB)")
+        _budget_report(ctx, tg)
         return
     preview = ctx.state / "preview.mp4"
     if preview.exists():
@@ -515,6 +547,7 @@ def _deliver(ctx: Ctx) -> None:
         f"full video is {size / 1e6:.0f}MB (Telegram cap 50MB) — state {state_ref}",
     )
     _log("[deliver] oversized: sent preview + contact sheet")
+    _budget_report(ctx, tg)
 
 
 def _parse_file_ids(raw: str) -> list[str]:

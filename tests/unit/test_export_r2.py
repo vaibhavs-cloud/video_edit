@@ -15,7 +15,7 @@ from vedit.config import ExportCfg, S3Cfg, load_config
 from vedit.stage import export
 
 _CONFIG = Path(__file__).resolve().parents[2] / "config.yaml"
-R2_HOST = "acc123.r2.cloudflarestorage.com"
+R2_HOST = "s3.us-east-005.backblazeb2.com"
 ENDPOINT = f"https://{R2_HOST}"
 REGION = "us-west-004"
 FIXED_NOW = datetime(2026, 10, 23, 15, 0, 0, tzinfo=timezone.utc)
@@ -38,6 +38,8 @@ def _export_on() -> ExportCfg:
             region=REGION,
             expires_h=72,
             teaser="video",
+            notify_gb=9.0,
+            evict_gb=9.5,
         )
     )
 
@@ -263,3 +265,95 @@ def test_upload_roundtrip_and_presign(r2_env, monkeypatch, tmp_path):
     assert uploads[0]["region"] == REGION
     assert link.startswith(f"{ENDPOINT}/vedit-exports/a1b2c3d4/final.mp4?")
     assert "X-Amz-Signature=" in link
+
+
+def _patch_bucket(monkeypatch, objects):
+    """Stub list/delete; records keys and mutates `objects` like real B2."""
+    deleted = []
+
+    monkeypatch.setattr(
+        export,
+        "list_objects",
+        lambda **kw: [dict(o) for o in objects],
+    )
+
+    def fake_delete(**kw):
+        deleted.append(kw["key"])
+        objects[:] = [o for o in objects if o["key"] != kw["key"]]
+
+    monkeypatch.setattr(export, "delete_object", fake_delete)
+    return deleted
+
+
+def _s3_cfg(**overrides):
+    base = {
+        "enabled": True,
+        "endpoint": ENDPOINT,
+        "bucket": "vedit-exports",
+        "region": REGION,
+        "expires_h": 72,
+        "teaser": "video",
+        "notify_gb": 9.0,
+        "evict_gb": 9.5,
+    }
+    base.update(overrides)
+    return S3Cfg(**base)
+
+
+def _cfg(**s3_overrides):
+    return dataclasses.replace(_config(), export=ExportCfg(s3=_s3_cfg(**s3_overrides)))
+
+
+def test_maintenance_below_notify_is_noop(r2_env, monkeypatch):
+    objects = [{"key": "a/final.mp4", "size": 1 << 20, "last": "2026-10-23T00:00:00Z"}]
+    deleted = _patch_bucket(monkeypatch, objects)
+    total, dels = export.maintenance(_cfg())
+    assert total == 1 << 20 and dels == [] and deleted == []
+
+
+def test_maintenance_notifies_only_between_thresholds(r2_env, monkeypatch):
+    total = int(9.2 * (1 << 30))
+    objects = [{"key": "a/final.mp4", "size": total, "last": "2026-10-23T00:00:00Z"}]
+    _patch_bucket(monkeypatch, objects)
+    assert export.maintenance(_cfg()) == (total, [])
+
+
+def test_maintenance_evicts_oldest_until_notify_level(r2_env, monkeypatch):
+    gb = 1 << 30
+    objects = [
+        {"key": "old1/final.mp4", "size": 5 * gb, "last": "2026-01-01T00:00:00Z"},
+        {"key": "old2/final.mp4", "size": 3 * gb, "last": "2026-02-01T00:00:00Z"},
+        {"key": "new/final.mp4", "size": 2 * gb, "last": "2026-10-23T00:00:00Z"},
+    ]
+    deleted = _patch_bucket(monkeypatch, objects)
+    total, dels = export.maintenance(_cfg())
+    # 10GB total -> above evict; deleting old1 (5GB) already lands below the
+    # 9GB notify line, so eviction stops after a single removal
+    assert dels == ["old1/final.mp4"]
+    assert deleted == dels
+    assert total == 5 * gb
+    assert [o["key"] for o in objects] == ["old2/final.mp4", "new/final.mp4"]
+
+
+def test_maintenance_config_knobs(r2_env, monkeypatch):
+    gb = 1 << 30
+    objects = [
+        {"key": "a/final.mp4", "size": 2 * gb, "last": "2026-01-01T00:00:00Z"},
+        {"key": "b/final.mp4", "size": 1 * gb, "last": "2026-06-01T00:00:00Z"},
+    ]
+    _patch_bucket(monkeypatch, objects)
+    total, dels = export.maintenance(_cfg(notify_gb=1.0, evict_gb=1.5))
+    # 3GB -> above evict; deleting a (2GB) leaves 1.0GB == notify boundary ->
+    # the loop key condition is total >= notify so b goes too, total 0
+    assert dels == ["a/final.mp4", "b/final.mp4"]
+    assert total == 0
+
+    objects = [
+        {"key": "a/final.mp4", "size": int(2 * gb), "last": "2026-01-01T00:00:00Z"},
+        {"key": "b/final.mp4", "size": int(0.8 * gb), "last": "2026-06-01T00:00:00Z"},
+    ]
+    _patch_bucket(monkeypatch, objects)
+    total, dels = export.maintenance(_cfg(notify_gb=1.0, evict_gb=1.2))
+    # 2.8GB above evict; deleting a leaves 0.8GB < 1.0GB target -> stop
+    assert dels == ["a/final.mp4"]
+    assert total == int(0.8 * gb)

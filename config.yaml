@@ -145,3 +145,5 @@ export:
     region: us-east-005
     expires_h: 72             # presigned link validity
     teaser: video             # video | document | none  (<=50MB chat copy)
+    notify_gb: 9.0            # telegram nudge when bucket storage crosses this
+    evict_gb: 9.5             # auto-delete least-recently-uploaded frees above this

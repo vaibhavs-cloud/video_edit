@@ -19,6 +19,7 @@ easy to unit test.
 
 from __future__ import annotations
 
+import math
 import statistics
 from dataclasses import replace
 
@@ -133,16 +134,22 @@ def _intervals(
     pre = cfg.pre_roll_ms / 1000.0
     post = cfg.post_roll_ms / 1000.0
 
-    start = max(0.0, words[0].s - pre)
-    end = min(dur, words[-1].e + post)
+    start = max(0.0, min(w.s for w in words) - pre)
+    end = min(dur, max(w.e for w in words) + post)
     if end <= start:
         raise CutsError("transcript does not fit inside the media duration")
 
+    # Whisper word spans may overlap (a stretched word can end after the next
+    # word starts). A cut boundary must never land inside ANY word before the
+    # cut, otherwise the word range of the earlier segment includes a word the
+    # interval does not fully contain (EditPlan validation would reject it).
+    running_end = 0.0
     cuts: list[tuple[float, float]] = []
     for i, is_cut in enumerate(cut_flags):
+        running_end = max(running_end, words[i].e)
         if not is_cut:
             continue
-        c_start = words[i].e + pad
+        c_start = running_end + pad
         c_end = words[i + 1].s - pad
         if c_end <= c_start:
             continue
@@ -179,12 +186,32 @@ def compute_segments(words: list[Word], dur: float, cfg: CutsCfg) -> list[Segmen
         inside = [w for w in words if start <= w.s and w.e <= end]
         if not inside:
             continue
+        lo_i, hi_i = inside[0].i, inside[-1].i
+        ranged = [w for w in words if lo_i <= w.i <= hi_i]
+        # Defensive: the inclusive word range must be fully inside the segment.
+        # Expand for any residual overlap, then round OUTWARD to milliseconds so
+        # rounding can never exclude a word that was inside the raw interval.
+        start = min(start, *(w.s for w in ranged))
+        end = max(end, *(w.e for w in ranged))
+        start = math.floor(round(start * 1000, 6)) / 1000
+        end = math.ceil(round(end * 1000, 6)) / 1000
+        bad = [
+            w for w in ranged if not (start <= w.s and w.e <= end)
+        ]  # pragma: no cover - guarded by construction
+        if bad:
+            raise CutsError(
+                f"word {bad[0].i} does not fit segment bounds [{start:.3f}, {end:.3f}]"
+            )
+        if segments and start < segments[-1].end:
+            start = segments[-1].end
+            if end <= start:
+                continue
         segments.append(
             Segment(
-                keep_from_word=inside[0].i,
-                keep_to_word=inside[-1].i,
-                start=round(start, 3),
-                end=round(end, 3),
+                keep_from_word=lo_i,
+                keep_to_word=hi_i,
+                start=start,
+                end=end,
             )
         )
     if not segments:

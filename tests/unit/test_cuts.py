@@ -166,3 +166,26 @@ def test_merge_tiny_multiple_islands_drain():
     merged = _merge_tiny(segs, 0.5)
     assert len(merged) == 2
     assert all(e - s >= 0.5 - 1e-6 for s, e in merged)
+
+
+def test_cut_boundary_never_splits_a_stretched_word(cfg):
+    # w3 is a stretched/overlapping span that ends after w4 starts; the pause
+    # after w4 triggers a cut. The boundary must move past w3.e, otherwise the
+    # segment's word range contains a word it does not fully contain (the
+    # production failure: "word 153 not inside segment 22").
+    words = [
+        _w(0, 0.0, 0.5),
+        _w(1, 0.6, 1.0),
+        _w(2, 1.1, 1.5),
+        _w(3, 1.6, 3.2),
+        _w(4, 1.7, 1.9),
+        _w(5, 4.5, 5.0),
+    ]
+    segs = compute_segments(words, 6.0, cfg.cuts)
+
+    assert len(segs) == 2
+    assert segs[0].keep_to_word == 4
+    for seg in segs:
+        for w in words:
+            if seg.keep_from_word <= w.i <= seg.keep_to_word:
+                assert seg.start <= w.s and w.e <= seg.end

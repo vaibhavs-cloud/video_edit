@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -929,6 +930,15 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _error_state_dir(args: argparse.Namespace) -> Path:
+    state = getattr(args, "state", "") or ""
+    if state:
+        return Path(state)
+    return Path(getattr(args, "out", "") or "out") / (
+        getattr(args, "name", "") or "run"
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     _setup_logging()
     _load_keys_file()
@@ -936,7 +946,23 @@ def main(argv: list[str] | None = None) -> int:
     for attr in ("attachments",):
         if hasattr(args, attr):
             setattr(args, attr, getattr(args, attr) or "")
-    return args.func(args)
+    try:
+        return args.func(args)
+    except Exception:
+        # The workflow's failure report sends last_error.txt to the chat; without
+        # this, crashes mid-stage surfaced only as "no video produced".
+        try:
+            target = _error_state_dir(args)
+            target.mkdir(parents=True, exist_ok=True)
+            error_file = target / "last_error.txt"
+            existing = (
+                error_file.read_text(encoding="utf-8") if error_file.exists() else ""
+            )
+            if "delivery failed" not in existing:
+                error_file.write_text(traceback.format_exc()[-6000:], encoding="utf-8")
+        except OSError as exc:
+            _LOG.warning("could not write last_error.txt: %s", exc)
+        raise
 
 
 if __name__ == "__main__":

@@ -1,13 +1,16 @@
-"""R2/S3 export: upload the final render and hand back a presigned link.
+"""S3-compatible export: upload the final render and hand back a presigned link.
 
 Telegram caps video uploads at 50MB (config: limits.telegram_send_max_bytes)
-and re-encodes whatever it does accept, so full quality goes to a private R2
-bucket with a time-limited presigned GET link instead. Everything needed for
-that (upload + link) happens here with stdlib only — no boto3, no rclone:
+and re-encodes whatever it does accept, so full quality goes to a private
+S3-compatible bucket (Backblaze B2 by default, Cloudflare R2 also works) with
+a time-limited presigned GET link instead. Everything needed for that (upload
++ link) happens here with stdlib only — no boto3, no rclone:
 
-- credentials come from env R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY (use-multi)
-- endpoint/bucket/expiry knobs live in config.yaml export.r2 (never in code)
-- signing is AWS SigV4 (R2 is S3-compatible, region already us-east-1)
+- credentials come from env R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY (the env
+  names are kept generic across providers)
+- endpoint/bucket/region/expiry knobs live in config.yaml export.s3 (never in
+  code); B2 expects region to match the bucket's endpoint region
+- signing is AWS SigV4 (service s3)
 """
 
 from __future__ import annotations
@@ -40,8 +43,20 @@ def creds() -> tuple[str, str]:
 
 
 def enabled(cfg) -> bool:
-    r2 = getattr(getattr(cfg, "export", None), "r2", None)
-    return bool(r2) and bool(r2.enabled) and all(creds())
+    s3 = getattr(getattr(cfg, "export", None), "s3", None)
+    return (
+        bool(s3)
+        and bool(s3.enabled)
+        and bool(getattr(s3, "endpoint", ""))
+        and all(creds())
+    )
+
+
+def _derive_signing_key(secret: str, date_s: str, region: str) -> bytes:
+    key = _hmac(("AWS4" + secret).encode(), date_s)
+    key = _hmac(key, region)
+    key = _hmac(key, "s3")
+    return _hmac(key, "aws4_request")
 
 
 def _host(endpoint: str) -> str:
@@ -61,12 +76,13 @@ def _sign_headers(
     payload_hash: str,
     access: str,
     secret: str,
+    region: str,
     now: datetime | None = None,
 ) -> dict[str, str]:
     """SigV4 Authorization headers for the direct upload PUT."""
     now = now or datetime.now(timezone.utc)
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
-    scope = f"{amz_date[:8]}/us-east-1/s3/aws4_request"
+    scope = f"{amz_date[:8]}/{region}/s3/aws4_request"
     headers = {
         "x-amz-content-sha256": payload_hash,
         "x-amz-date": amz_date,
@@ -83,10 +99,7 @@ def _sign_headers(
             hashlib.sha256(canonical.encode()).hexdigest(),
         ]
     )
-    signing_key = _hmac(("AWS4" + secret).encode(), amz_date[:8])
-    signing_key = _hmac(signing_key, "us-east-1")
-    signing_key = _hmac(signing_key, "s3")
-    signing_key = _hmac(signing_key, "aws4_request")
+    signing_key = _derive_signing_key(secret, amz_date[:8], region)
     signature = hmac.new(
         signing_key, string_to_sign.encode(), hashlib.sha256
     ).hexdigest()
@@ -107,13 +120,14 @@ def _presign_get(
     expires: int,
     access: str,
     secret: str,
+    region: str,
     now: datetime | None = None,
 ) -> str:
     """Time-limited GET link for a stored object — signs only the host header
     so plain browsers/apps can open it without sending any x-amz headers."""
     now = now or datetime.now(timezone.utc)
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
-    scope = f"{amz_date[:8]}/us-east-1/s3/aws4_request"
+    scope = f"{amz_date[:8]}/{region}/s3/aws4_request"
     host = _host(endpoint)
     query = {
         "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
@@ -127,15 +141,9 @@ def _presign_get(
         f"{urllib.parse.quote(query[k], safe='-_.~')}"
         for k in sorted(query)
     )
-    canonical = "\n".join(
-        [
-            "GET",
-            _path(bucket, key),
-            canonical_query,
-            f"host:{host}",
-            "host",
-            "UNSIGNED-PAYLOAD",
-        ]
+    canonical = (
+        f"GET\n{_path(bucket, key)}\n{canonical_query}\nhost:{host}\n"
+        f"host\nUNSIGNED-PAYLOAD"
     )
     string_to_sign = "\n".join(
         [
@@ -145,10 +153,7 @@ def _presign_get(
             hashlib.sha256(canonical.encode()).hexdigest(),
         ]
     )
-    signing_key = _hmac(("AWS4" + secret).encode(), amz_date[:8])
-    signing_key = _hmac(signing_key, "us-east-1")
-    signing_key = _hmac(signing_key, "s3")
-    signing_key = _hmac(signing_key, "aws4_request")
+    signing_key = _derive_signing_key(secret, amz_date[:8], region)
     signature = hmac.new(
         signing_key, string_to_sign.encode(), hashlib.sha256
     ).hexdigest()
@@ -157,7 +162,9 @@ def _presign_get(
     )
 
 
-def presign_url(*, endpoint: str, bucket: str, key: str, expires: int) -> str:
+def presign_url(
+    *, endpoint: str, bucket: str, key: str, expires: int, region: str
+) -> str:
     access, secret = creds()
     if not access or not secret:
         raise ExportError("R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY are not set")
@@ -166,12 +173,13 @@ def presign_url(*, endpoint: str, bucket: str, key: str, expires: int) -> str:
         bucket=bucket,
         key=key,
         expires=max(60, expires),
+        region=region,
         access=access,
         secret=secret,
     )
 
 
-def _upload(*, endpoint: str, bucket: str, key: str, src: Path) -> None:
+def _upload(*, endpoint: str, bucket: str, key: str, src: Path, region: str) -> None:
     access, secret = creds()
     if not src.exists():
         raise ExportError(f"missing export source: {src}")
@@ -196,6 +204,7 @@ def _upload(*, endpoint: str, bucket: str, key: str, src: Path) -> None:
             payload_hash=sha.hexdigest(),
             access=access,
             secret=secret,
+            region=region,
         )
         try:
             with httpx.Client(
@@ -207,9 +216,9 @@ def _upload(*, endpoint: str, bucket: str, key: str, src: Path) -> None:
                     return
                 if resp.status_code < 500:
                     raise ExportError(
-                        f"r2 upload rejected: {resp.status_code} {resp.text[:200]}"
+                        f"upload rejected: {resp.status_code} {resp.text[:200]}"
                     )
-                last = ExportError(f"r2 {resp.status_code}")
+                last = ExportError(f"upload {resp.status_code}")
         except (httpx.TimeoutException, httpx.ConnectError) as exc:
             last = exc
         if attempt < 2:
@@ -220,11 +229,21 @@ def _upload(*, endpoint: str, bucket: str, key: str, src: Path) -> None:
 
 def upload_and_presign(cfg, state: Path, ref: str) -> str:
     """Upload final.mp4 and return the presigned link. Raises ExportError."""
-    r2 = cfg.export.r2
-    if not creds()[0]:
+    s3 = cfg.export.s3
+    if not all(creds()):
         raise ExportError("R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY are not set")
     key = f"{ref}/final.mp4"
-    _upload(endpoint=r2.endpoint, bucket=r2.bucket, key=key, src=state / "final.mp4")
+    _upload(
+        endpoint=s3.endpoint,
+        bucket=s3.bucket,
+        key=key,
+        src=state / "final.mp4",
+        region=s3.region,
+    )
     return presign_url(
-        endpoint=r2.endpoint, bucket=r2.bucket, key=key, expires=r2.expires_h * 3600
+        endpoint=s3.endpoint,
+        bucket=s3.bucket,
+        key=key,
+        expires=s3.expires_h * 3600,
+        region=s3.region,
     )

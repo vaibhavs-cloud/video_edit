@@ -117,17 +117,25 @@ class LimitsCfg:
 
 
 @dataclass(frozen=True)
-class R2Cfg:
+class S3Cfg:
+    """S3-compatible full-quality delivery (R2 / Backblaze B2 / any s3 endpoint).
+
+    upload + presign credentials come from env R2_ACCESS_KEY_ID /
+    R2_SECRET_ACCESS_KEY (kept for cross-provider compat); endpoint, bucket,
+    region and presign expiry are configured here.
+    """
+
     enabled: bool
     endpoint: str
     bucket: str
+    region: str
     expires_h: int
     teaser: str  # video | document | none
 
 
 @dataclass(frozen=True)
 class ExportCfg:
-    r2: R2Cfg
+    s3: S3Cfg
 
 
 @dataclass(frozen=True)
@@ -167,6 +175,6 @@ def load_config(path: str | Path) -> Config:
         qc=QcCfg(**data["qc"]),
         limits=LimitsCfg(**data["limits"]),
         retry=RetryCfg(**data["retry"]),
-        export=ExportCfg(r2=R2Cfg(**data["export"]["r2"])),
+        export=ExportCfg(s3=S3Cfg(**data["export"]["s3"])),
         hash=hashlib.sha256(raw).hexdigest()[:16],
     )

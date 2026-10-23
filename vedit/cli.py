@@ -460,6 +460,7 @@ def _run_stages(ctx: Ctx, start: str = "acquire") -> None:
 
 
 def _deliver(ctx: Ctx) -> None:
+    from vedit.stage.export import upload_and_presign
     from vedit.telegram_client import Telegram
 
     final = ctx.state / "final.mp4"
@@ -472,8 +473,32 @@ def _deliver(ctx: Ctx) -> None:
         f"QC {'PASS' if qc_result.passed else 'FAIL'} · state {state_ref}"
     )
     tg = Telegram()
-    size = final.stat().st_size if final.exists() else 0
-    if size <= ctx.cfg.limits.telegram_send_max_bytes:
+    if not final.exists():
+        raise FileNotFoundError(str(final))
+    size = final.stat().st_size
+
+    # Full quality lives on R2 as a time-limited link; the Telegram copy is a
+    # teaser (Telegram recompresses sendVideo and caps uploads at 50MB).
+    link = None
+    if size > 0 and ctx.cfg.export.r2.enabled:
+        try:
+            link = upload_and_presign(ctx.cfg, ctx.state, state_ref)
+        except Exception as exc:  # noqa: BLE001 — deliver must not die on R2 hiccups
+            _log(f"[deliver] r2 upload failed, falling back to chat delivery: {exc}")
+
+    fits_telegram = 0 < size <= ctx.cfg.limits.telegram_send_max_bytes
+    teaser = ctx.cfg.export.r2.teaser
+    if link is not None:
+        if fits_telegram and teaser == "document":
+            tg.send_document(ctx.chat_id, final, caption + " · bit-exact copy")
+            _log(f"[deliver] document sent ({size / 1e6:.1f}MB, bit-exact)")
+        elif fits_telegram and teaser == "video":
+            tg.send_video(ctx.chat_id, final, caption + " · full quality at link")
+            _log(f"[deliver] teaser sent ({size / 1e6:.1f}MB) + r2 link")
+        tg.send_message(ctx.chat_id, f"full quality (no re-encode): {link}")
+        _log(f"[deliver] r2 link sent ({size / 1e6:.1f}MB)")
+        return
+    if fits_telegram:
         tg.send_video(ctx.chat_id, final, caption)
         _log(f"[deliver] final.mp4 sent ({size / 1e6:.1f}MB)")
         return

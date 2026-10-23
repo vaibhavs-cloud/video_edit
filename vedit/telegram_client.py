@@ -136,5 +136,17 @@ class Telegram:
             )
         )
 
+    def send_document(self, chat_id: str, path: Path, caption: str = "") -> None:
+        """Bit-exact copy as a document (no re-encode; no inline player)."""
+        payload = path.read_bytes()
+        self._ok(
+            _post(
+                self._url("sendDocument"),
+                data={"chat_id": chat_id, "caption": caption[:1000]},
+                files={"document": (path.name, payload, "video/mp4")},
+                timeout=600,
+            )
+        )
+
     def close(self) -> None:
         self._client.close()

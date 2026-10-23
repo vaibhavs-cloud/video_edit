@@ -147,6 +147,8 @@ jobs:
           IN_PROMPT: ${{ inputs.prompt }}
           INSTRUCTION: ${{ inputs.instruction }}
           CHAT_ID: ${{ inputs.chat_id }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: |
           set -euo pipefail
           if [ "$KIND" = "fix" ]; then

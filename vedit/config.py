@@ -117,6 +117,20 @@ class LimitsCfg:
 
 
 @dataclass(frozen=True)
+class R2Cfg:
+    enabled: bool
+    endpoint: str
+    bucket: str
+    expires_h: int
+    teaser: str  # video | document | none
+
+
+@dataclass(frozen=True)
+class ExportCfg:
+    r2: R2Cfg
+
+
+@dataclass(frozen=True)
 class RetryCfg:
     llm_attempts: int
     llm_backoff_s: float
@@ -135,6 +149,7 @@ class Config:
     qc: QcCfg
     limits: LimitsCfg
     retry: RetryCfg
+    export: ExportCfg
     hash: str
 
 
@@ -152,5 +167,6 @@ def load_config(path: str | Path) -> Config:
         qc=QcCfg(**data["qc"]),
         limits=LimitsCfg(**data["limits"]),
         retry=RetryCfg(**data["retry"]),
+        export=ExportCfg(r2=R2Cfg(**data["export"]["r2"])),
         hash=hashlib.sha256(raw).hexdigest()[:16],
     )

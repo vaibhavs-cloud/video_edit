@@ -84,6 +84,7 @@ def _sign_headers(
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     scope = f"{amz_date[:8]}/{region}/s3/aws4_request"
     headers = {
+        "host": host,
         "x-amz-content-sha256": payload_hash,
         "x-amz-date": amz_date,
         **extra_headers,
@@ -142,7 +143,7 @@ def _presign_get(
         for k in sorted(query)
     )
     canonical = (
-        f"GET\n{_path(bucket, key)}\n{canonical_query}\nhost:{host}\n"
+        f"GET\n{_path(bucket, key)}\n{canonical_query}\nhost:{host}\n\n"
         f"host\nUNSIGNED-PAYLOAD"
     )
     string_to_sign = "\n".join(
@@ -188,9 +189,8 @@ def _upload(*, endpoint: str, bucket: str, key: str, src: Path, region: str) -> 
         raise ExportError(f"empty export source: {src}")
     endpoint = endpoint.rstrip("/")
     sha = hashlib.sha256()
-    with src.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            sha.update(chunk)
+    payload = src.read_bytes()
+    sha.update(payload)
     url = f"{endpoint}{_path(bucket, key)}"
     last: Exception | None = None
     for attempt in range(3):
@@ -210,8 +210,11 @@ def _upload(*, endpoint: str, bucket: str, key: str, src: Path, region: str) -> 
             with httpx.Client(
                 timeout=httpx.Timeout(1800.0), follow_redirects=True
             ) as client:
-                with src.open("rb") as fh:
-                    resp = client.put(url, headers=headers, content=fh)
+                resp = client.put(
+                    url,
+                    headers={**headers, "Content-Length": str(len(payload))},
+                    content=payload,
+                )
                 if resp.status_code < 300:
                     return
                 if resp.status_code < 500:

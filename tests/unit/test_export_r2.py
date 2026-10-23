@@ -61,7 +61,7 @@ def test_config_parses_export_section_and_defaults_off():
     cfg = _config()
     assert cfg.export.s3.bucket == "vedit-exports"
     assert cfg.export.s3.teaser in {"video", "document", "none"}
-    assert not cfg.export.s3.enabled  # off until bucket + app key exist
+    assert cfg.export.s3.enabled  # on: bucket + app key exist
 
 
 def test_enabled_gating(monkeypatch):
@@ -72,7 +72,7 @@ def test_enabled_gating(monkeypatch):
     monkeypatch.setenv("R2_ACCESS_KEY_ID", "a")
     monkeypatch.setenv("R2_SECRET_ACCESS_KEY", "s")
     assert export.enabled(on)
-    assert not export.enabled(_config())  # disabled in repo config
+    assert export.enabled(_config())  # repo config has live B2 creds path
 
 
 def test_presign_signs_only_host(r2_env):
@@ -108,7 +108,8 @@ def test_presign_signs_only_host(r2_env):
         )
     )
     canonical = (
-        f"GET\n{parsed.path}\n{canonical_query}\nhost:{R2_HOST}\nhost\nUNSIGNED-PAYLOAD"
+        f"GET\n{parsed.path}\n{canonical_query}\nhost:{R2_HOST}\n\n"
+        f"host\nUNSIGNED-PAYLOAD"
     )
     k_date = hmac.new(
         ("AWS4" + r2_env[1]).encode(), b"20261023", hashlib.sha256
@@ -128,7 +129,7 @@ def test_presign_signs_only_host(r2_env):
     assert query["X-Amz-Signature"] == [expected]
 
 
-def test_upload_headers(r2_env):
+def test_sign_headers_includes_host(r2_env):
     headers = export._sign_headers(
         method="PUT",
         host=R2_HOST,
@@ -137,14 +138,15 @@ def test_upload_headers(r2_env):
         payload_hash="abc123",
         access=r2_env[0],
         secret=r2_env[1],
-        region=REGION,
         now=FIXED_NOW,
+        region=REGION,
     )
     auth = headers["Authorization"]
     assert auth.startswith(
         f"AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20261023/{REGION}/s3/aws4_request"
     )
-    assert "SignedHeaders=content-type;x-amz-content-sha256;x-amz-date" in auth
+    assert "SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date" in auth
+    assert headers["host"] == R2_HOST
     assert headers["x-amz-content-sha256"] == "abc123"
 
 
@@ -166,7 +168,15 @@ def _fake_client(monkeypatch, responses):
             pass
 
         def put(self, url, headers=None, content=None):
-            calls.append({"url": url, "headers": headers, "body": b"".join(content)})
+            calls.append(
+                {
+                    "url": url,
+                    "headers": headers,
+                    "body": content
+                    if isinstance(content, (bytes, bytearray))
+                    else b"".join(content),
+                }
+            )
             return responses[len(calls) - 1] if len(responses) > 1 else responses[0]
 
         def __enter__(self):

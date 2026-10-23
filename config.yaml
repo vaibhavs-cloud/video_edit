@@ -139,9 +139,9 @@ retry:
 # Credentials come from env R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY.
 export:
   s3:
-    enabled: false            # flip to true once the bucket + app key exist
-    endpoint: ""              # e.g. https://s3.us-west-004.backblazeb2.com (bucket page shows it)
+    enabled: true
+    endpoint: https://s3.us-east-005.backblazeb2.com
     bucket: vedit-exports
-    region: us-west-004       # B2 endpoint region (us-east-1 for R2)
+    region: us-east-005
     expires_h: 72             # presigned link validity
     teaser: video             # video | document | none  (<=50MB chat copy)

@@ -141,6 +141,16 @@ class ExportCfg:
 
 
 @dataclass(frozen=True)
+class InsertCfg:
+    """Clips inserted into the reel (Telegram videos sent alongside a build)."""
+
+    default_s: float = 10.0  # use the first N seconds unless told otherwise
+    max_s: float = 120.0  # hard cap per inserted clip
+    audio: bool = True  # keep the clip's own audio by default
+    fit: str = "adaptive"  # adaptive = smart fit; cover = crop to fill
+
+
+@dataclass(frozen=True)
 class RetryCfg:
     llm_attempts: int
     llm_backoff_s: float
@@ -160,6 +170,7 @@ class Config:
     limits: LimitsCfg
     retry: RetryCfg
     export: ExportCfg
+    inserts: InsertCfg
     hash: str
 
 
@@ -178,5 +189,6 @@ def load_config(path: str | Path) -> Config:
         limits=LimitsCfg(**data["limits"]),
         retry=RetryCfg(**data["retry"]),
         export=ExportCfg(s3=S3Cfg(**data["export"]["s3"])),
+        inserts=InsertCfg(**data.get("inserts", {})),
         hash=hashlib.sha256(raw).hexdigest()[:16],
     )

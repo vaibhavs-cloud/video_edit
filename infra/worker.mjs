@@ -5,11 +5,13 @@
 // Slash commands (deterministic, never touch the LLM):
 //   /new [link]                            stage the video/link to build from
 //   /addimage                              photo caption hint (label + time)
-//   /build (/done /go)                     dispatch staged video/link + images
+//   /addvideo                              next video(s) are inserted clips
+//   /build (/done /go)                     dispatch staged video/link + images/clips
 //   /list /status /cancel /help            staging + run polling + wipe + menu
 //   /change <anything>                     dry-run preview, no talker classification
 //   /cut 0:30 0:45 · /keep 0:10 1:00       cut_range / keep_range previews
 //   /place image 3 at 0:20 · /move · /remove · /size image 3 60%
+//   /place video 1 at 0:20 for 5s · /move video 1 to 0:40 · /remove video 1
 //   /recaption 0:45 <new text>
 //   /preset clean_voice|punchy|flat        audio recipe (denoise stays on)
 //   /editimage [N]                         image menu: aspect / crop / size
@@ -28,7 +30,9 @@
 //   `cancel`                              -> clear staging (+ pending confirm), dispatch nothing
 //   text containing a URL (nothing staged)-> stage the link, wait for `done`
 //   photo / image file                    -> stage it (caption = label + time), wait
-//   video attachment <= 20 MB             -> stage it, wait for `done`
+//   video attachment <= 20 MB             -> stage the SOURCE video if none is
+//                                            staged, else stage it as an inserted
+//                                            clip (also after /addvideo)
 //   video attachment > 20 MB              -> reply asking for a Drive link
 //
 // Staging images are consumed ONLY by /build: previews and fix runs read them
@@ -36,7 +40,9 @@
 //
 // Talk policy lives here at the edge (fast, ~1 cheap LLM call per message);
 // ALL edit decisions stay in-repo (parse -> dry-run preview -> apply-preview).
-// Staging lives in KV (1h TTL): pending_video:<chat> + pending:<chat>.
+// Staging lives in KV (1h TTL): pending_video:<chat> + pending:<chat> +
+// pending_clips:<chat>. Inserted clips are forwarded to the workflow as a JSON
+// spec array and stored under state/inserts/ for later refinements.
 // Dialogue memory: conv:<chat> (last 6 turns, 1h TTL).
 // Pending confirm: pending_confirm:<chat> {state_ref, instruction, ts} (30 min).
 // Edit menu state: edit_menu:<chat> {state_ref, vid, ts} (10 min).
@@ -72,16 +78,17 @@ const CMD_REG_TTL = 604800; // refresh the Telegram command menu weekly
 const BOT_COMMANDS = [
   { command: "new", description: "start a new edit — send a link or video next" },
   { command: "addimage", description: "add images (send photo, caption = label + time)" },
-  { command: "build", description: "join staged video + images, build the cut" },
+  { command: "addvideo", description: "add a video clip (caption = at 0:20 for 5s)" },
+  { command: "build", description: "join staged video + images + clips, build the cut" },
   { command: "status", description: "live status of the latest run" },
   { command: "list", description: "show what's staged right now" },
   { command: "cancel", description: "clear staging + pending previews" },
   { command: "change", description: "any edit, previewed first: /change cut the intro" },
   { command: "cut", description: "remove a span: /cut 0:30 0:45" },
   { command: "keep", description: "keep only a span: /keep 0:10 1:00" },
-  { command: "place", description: "place an image: /place image 3 at 0:20" },
-  { command: "move", description: "move an image: /move image 3 to 0:40" },
-  { command: "remove", description: "remove an image: /remove image 3" },
+  { command: "place", description: "place an image/video: /place video 1 at 0:20" },
+  { command: "move", description: "move an image/video: /move video 1 to 0:40" },
+  { command: "remove", description: "remove an image/video: /remove video 1" },
   { command: "size", description: "resize an image: /size image 3 60%" },
   { command: "recaption", description: "redo captions: /recaption 0:45 better text" },
   { command: "editimage", description: "image menu: fill/blur/box + crop + size" },
@@ -98,9 +105,11 @@ const HELP_TEXT =
   "1. `/new` and send the video (or drive link) — or just send it right away\n" +
   "2. images: send photos, captions like `pyramid at 0:20`\n" +
   "3. `/build` → wait → you get the cut + a preview frame\n" +
+  "Inserted clips: `/addvideo`, then send the clip (caption `at 0:20 for 5s`)\n" +
   "Edits (every edit is previewed first, then YES/NO buttons):\n" +
   "`/change cut the intro` · `/cut 0:30 0:45` · `/keep 0:10 1:00`\n" +
   "`/place image 3 at 0:20` · `/move image 3 to 0:40` · `/remove image 3`\n" +
+  "`/place video 1 at 0:20 for 5s` · `/move video 1 to 0:40` · `/remove video 1`\n" +
   "`/size image 3 60%` · `/recaption 0:45 better text`\n" +
   "`/editimage 3` → buttons: aspect (fill/blur/box) · crop (top/center/bottom) · size\n" +
   "`/preset clean_voice|punchy|flat` → audio recipe (noise-cancelling always on)\n" +
@@ -114,9 +123,18 @@ function fixInstruction(cmd, args) {
   if (cmd === "change") return a;
   if (cmd === "cut") return a.startsWith("cut") ? a : `cut from ${a}`;
   if (cmd === "keep" || cmd === "clip") return a.startsWith("keep") ? a : `keep only ${a}`;
-  if (cmd === "place") return a.startsWith("place") ? a : `place ${a}`;
-  if (cmd === "move") return a.startsWith("move") ? a : `move the visual ${a}`;
-  if (cmd === "remove") return a.startsWith("remove") ? a : `remove ${a}`;
+  if (cmd === "place") {
+    if (/^(?:videos?|clips?|inserts?)\b/i.test(a)) return `insert_video ${a}`;
+    return a.startsWith("place") ? a : `place ${a}`;
+  }
+  if (cmd === "move") {
+    if (/^(?:videos?|clips?|inserts?)\b/i.test(a)) return `retime_insert ${a}`;
+    return a.startsWith("move") ? a : `move the visual ${a}`;
+  }
+  if (cmd === "remove") {
+    if (/^(?:videos?|clips?|inserts?)\b/i.test(a)) return `remove_insert ${a}`;
+    return a.startsWith("remove") ? a : `remove ${a}`;
+  }
   if (cmd === "size") return a.startsWith("resize") ? a : `resize ${a}`;
   if (cmd === "recaption") return a.startsWith("recaption") ? a : `recaption ${a}`;
   if (cmd === "preset") return a.startsWith("preset") ? a : `preset ${a}`;
@@ -127,9 +145,10 @@ const CMD_USAGE = new Map([
   ["cut", "usage: `/cut 0:30 0:45` (or /cut where I say um)"],
   ["keep", "usage: `/keep 0:10 1:00` — cut everything else"],
   ["clip", "usage: `/clip 0:10 1:00` — same as /keep"],
-  ["place", "usage: `/place image 3 at 0:20`"],
-  ["move", "usage: `/move image 3 to 0:40`"],
-  ["remove", "usage: `/remove image 3` or `/remove the image at 0:54`"],
+  ["place", "usage: `/place image 3 at 0:20` or `/place video 1 at 0:20 for 5s`"],
+  ["move", "usage: `/move image 3 to 0:40` or `/move video 1 to 0:40`"],
+  ["remove", "usage: `/remove image 3` or `/remove video 1`"],
+  ["addvideo", "usage: `/addvideo`, then send the clip (caption `at 0:20 for 5s`)"],
   ["size", "usage: `/size image 3 60%` or `/size image 3 bigger`"],
   ["recaption", "usage: `/recaption 0:45 your corrected line`"],
   ["preset", "usage: `/preset clean_voice` (also punchy / flat)"],
@@ -307,6 +326,7 @@ async function handleUpdate(update, env) {
       await clearPendingConfirm(env, chatId);
       await takePending(env, chatId);
       await clearVideo(env, chatId);
+      await clearClips(env, chatId);
       await sendText(
         env,
         chatId,
@@ -387,7 +407,7 @@ async function handleUpdate(update, env) {
     return;
   }
 
-  // 5) video attachment -> stage it (<= 20 MB), wait for `done`
+  // 5) video attachment -> source when nothing is staged, else an inserted clip
   const media =
     msg.video ||
     (msg.document && /^video\//.test(msg.document.mime_type || "") ? msg.document : null);
@@ -401,6 +421,40 @@ async function handleUpdate(update, env) {
       );
       return;
     }
+    const sourceStaged = await getVideo(env, chatId);
+    const clips = await getClips(env, chatId);
+    const asClip =
+      Boolean(sourceStaged) || (await getClipMode(env, chatId)) || clips.length > 0;
+    if (asClip) {
+      const n = clips.length + 1;
+      const meta = parseClipCaption(text, `clip ${n}`);
+      const clip = {
+        id: `clip-${n}`,
+        file_id: media.file_id,
+        at: meta.at,
+        duration: meta.duration,
+        trim_start: meta.trim_start,
+        muted: meta.muted,
+        fit: meta.fit,
+        label: meta.label,
+        source_dur: Number(media.duration) || null,
+      };
+      const count = await pushClip(env, chatId, clip);
+      const when =
+        meta.at == null ? "at the start" : `at ${fmtTime(meta.at)}`;
+      const howLong =
+        meta.duration == null ? "" : ` for ${meta.duration}s`;
+      const echo = `clip ${count} saved (${when}${howLong}${meta.muted ? ", muted" : ""})`;
+      await sendText(
+        env,
+        chatId,
+        `${echo} — ` +
+          (!sourceStaged
+            ? `say where it goes ("put video ${count} at 0:20") and I'll preview it.`
+            : `send more, or 'done' and I'll build v1 with it.`),
+      );
+      return;
+    }
     await setVideo(env, chatId, {
       kind: "video",
       ref: media.file_id,
@@ -411,7 +465,8 @@ async function handleUpdate(update, env) {
       env,
       chatId,
       `video received — ${staged.length} image(s) already staged. ` +
-        "Send images with captions (`name at 0:20`), then 'done' and I'll build v1. Nothing runs until then.",
+        "Send images with captions (`name at 0:20`), or `/addvideo` for clips, " +
+        "then 'done' and I'll build v1. Nothing runs until then.",
     );
     return;
   }
@@ -451,18 +506,7 @@ async function handleUpdate(update, env) {
 // rules BEFORE the talker — the model never gets to misread "yess" again.
 async function chatTurn(env, chatId, { text, replyRef, pending }) {
   if (pending && STRICT_YES_RE.test(text)) {
-    await clearPendingConfirm(env, chatId);
-    await sendText(
-      env,
-      chatId,
-      "Applying now — new cut lands here in a few minutes.",
-    );
-    await dispatch(env, {
-      kind: "fix-apply",
-      chat_id: chatId,
-      state_ref: pending.state_ref,
-      instruction: "",
-    });
+    await dispatchApply(env, chatId, pending);
     return;
   }
   if (pending && STRICT_NO_RE.test(text)) {
@@ -478,12 +522,22 @@ async function chatTurn(env, chatId, { text, replyRef, pending }) {
   const turns = await getConv(env, chatId);
   const staged = await getPending(env, chatId);
   const video = await getVideo(env, chatId);
+  const clips = await getClips(env, chatId);
   let lastState = replyRef || pending?.state_ref || null;
   if (!lastState) lastState = await getLatestStateRef(env);
   const talk = await askTalker(env, {
     text,
     turns,
-    staged: { images: staged.length, video: Boolean(video) },
+    staged: {
+      images: staged.length,
+      video: Boolean(video),
+      clips: clips.map((c) => ({
+        id: c.id,
+        at: c.at,
+        duration: c.duration,
+        muted: c.muted,
+      })),
+    },
     pending: pending ? { op: pending.op, instruction: pending.instruction } : null,
     lastState,
     replyRef,
@@ -520,13 +574,7 @@ async function chatTurn(env, chatId, { text, replyRef, pending }) {
       );
       return;
     }
-    await clearPendingConfirm(env, chatId);
-    await dispatch(env, {
-      kind: "fix-apply",
-      chat_id: chatId,
-      state_ref: pending.state_ref,
-      instruction: "",
-    });
+    await dispatchApply(env, chatId, pending);
     return;
   }
   if (talk.action === "no") {
@@ -557,6 +605,7 @@ async function routeCommand(env, msg, chatId) {
       return;
     case "list": {
       const imgs = await getPending(env, chatId);
+      const clips = await getClips(env, chatId);
       const video = await getVideo(env, chatId);
       const lines = imgs.map((im, i) => {
         const p = parsePlacement(im.note || "", `image ${i + 1}`);
@@ -566,11 +615,23 @@ async function routeCommand(env, msg, chatId) {
             : ` · ${p.end == null ? "from " + fmtTime(p.start) : fmtTime(p.start) + "–" + fmtTime(p.end)}`;
         return `• ${p.label}${t}`;
       });
+      const clipLines = clips.map((c, i) => {
+        const when = c.at == null ? "start" : fmtTime(c.at);
+        const len = c.duration == null ? "" : ` for ${c.duration}s`;
+        return `• clip ${i + 1}${c.label ? ` (${c.label})` : ""} · ${when}${len}${c.muted ? " · muted" : ""}`;
+      });
+      const imgBlock = lines.length
+        ? lines.join("\n")
+        : "no images staged — send photos or /addimage";
+      const clipBlock = clipLines.length
+        ? "\n" + clipLines.join("\n")
+        : "";
       await sendText(
         env,
         chatId,
         (video ? `video: staged (${video.kind === "url" ? "link" : "file"})\n` : "video: none staged\n") +
-          (lines.length ? lines.join("\n") : "no images staged — send photos or /addimage"),
+          imgBlock +
+          clipBlock,
       );
       return;
     }
@@ -581,6 +642,7 @@ async function routeCommand(env, msg, chatId) {
       await clearPendingConfirm(env, chatId);
       await takePending(env, chatId);
       await clearVideo(env, chatId);
+      await clearClips(env, chatId);
       await sendText(
         env,
         chatId,
@@ -588,6 +650,9 @@ async function routeCommand(env, msg, chatId) {
       );
       return;
     case "new": {
+      await clearPendingConfirm(env, chatId);
+      await clearVideo(env, chatId);
+      await clearClips(env, chatId);
       const url = args.match(/https?:\/\/\S+/);
       if (url) {
         await setVideo(env, chatId, {
@@ -616,6 +681,26 @@ async function routeCommand(env, msg, chatId) {
         "send the photo(s) now — captions carry the label + time, e.g. `pyramid at 0:20`.",
       );
       return;
+    case "addvideo": {
+      const source = await getVideo(env, chatId);
+      const built = source || (await getLatestStateRef(env));
+      if (!built) {
+        await sendText(
+          env,
+          chatId,
+          "send the main video first (or /new <link>), then /addvideo for clips.",
+        );
+        return;
+      }
+      await setClipMode(env, chatId);
+      await sendText(
+        env,
+        chatId,
+        "send the video clip now (<= 20MB). Caption can carry placement + length, " +
+          "e.g. `at 0:20 for 5s`, `from 0:03 for 8s`, `mute`.",
+      );
+      return;
+    }
     case "build":
     case "done":
     case "go":
@@ -626,14 +711,7 @@ async function routeCommand(env, msg, chatId) {
         await sendText(env, chatId, "nothing waiting for approval — nothing applied.");
         return;
       }
-      await clearPendingConfirm(env, chatId);
-      await sendText(env, chatId, "Applying now — new cut lands here in a few minutes.");
-      await dispatch(env, {
-        kind: "fix-apply",
-        chat_id: chatId,
-        state_ref: pending.state_ref,
-        instruction: "",
-      });
+      await dispatchApply(env, chatId, pending);
       return;
     }
     case "reject": {
@@ -711,33 +789,40 @@ async function buildCommand(env, chatId, source) {
   const video = await getVideo(env, chatId);
   if (!video) {
     const staged = await getPending(env, chatId);
+    const clipCount = (await getClips(env, chatId)).length;
     const known =
       source === "build" ? "/build" : `'${source}'`;
     await sendText(
       env,
       chatId,
-      staged.length
-        ? `no video staged yet — ${staged.length} image(s) waiting. Send the video or a link first.`
+      staged.length || clipCount
+        ? `no video staged yet — ${staged.length} image(s), ${clipCount} clip(s) waiting. Send the video or a link first.`
         : `nothing staged — send a video or link (or '/new <link>'), then ${known}.`,
     );
     return;
   }
   const imgs = await takePending(env, chatId);
+  const clips = await takeClips(env, chatId);
+  await clearClipMode(env, chatId);
   await clearVideo(env, chatId);
   const inputs = {
     kind: "new",
     chat_id: chatId,
-    prompt: buildPrompt(video.prompt, imgs),
+    prompt: buildPrompt(video.prompt, imgs, clips),
     attachments: JSON.stringify(imgs.map((im) => im.id)),
   };
+  if (clips.length) inputs.clips = JSON.stringify(clips);
   if (video.kind === "url") inputs.url = video.ref;
   else inputs.video_file_id = video.ref;
   await dispatch(env, inputs);
+  const extras = [];
+  if (imgs.length) extras.push(`${imgs.length} image(s)`);
+  if (clips.length) extras.push(`${clips.length} clip(s)`);
   await sendText(
     env,
     chatId,
-    imgs.length
-      ? `queued — building v1 from your video + ${imgs.length} image(s). /status for progress.`
+    extras.length
+      ? `queued — building v1 from your video + ${extras.join(" + ")}. /status for progress.`
       : "queued — processing your video now. /status for progress.",
   );
 }
@@ -761,15 +846,18 @@ async function previewFix(env, chatId, instruction, refHint, { silent } = {}) {
     );
     return;
   }
+  const clips = await getClips(env, chatId);
   const samePending =
     pending &&
     pending.state_ref === ref &&
-    pending.instruction === instruction;
+    pending.instruction === instruction &&
+    JSON.stringify(pending.clips || []) === JSON.stringify(clips);
   if (!samePending) {
     await setPendingConfirm(env, chatId, {
       state_ref: ref,
       instruction,
       op: "fix",
+      clips,
       ts: Date.now(),
     });
   }
@@ -779,6 +867,7 @@ async function previewFix(env, chatId, instruction, refHint, { silent } = {}) {
     state_ref: ref,
     instruction,
     attachments: JSON.stringify((await peekPending(env, chatId)).map((im) => im.id)),
+    clips: JSON.stringify(clips),
   });
   if (!silent) {
     await sendText(
@@ -787,6 +876,22 @@ async function previewFix(env, chatId, instruction, refHint, { silent } = {}) {
       `previewing: “${instruction.slice(0, 120)}” — frame + summary arrive in about a minute, then YES/NO buttons.`,
     );
   }
+}
+
+// Confirm the pending preview: apply exactly what was previewed (including the
+// clip set), then drop those clips - the applied run state now owns them.
+async function dispatchApply(env, chatId, pending) {
+  await clearPendingConfirm(env, chatId);
+  await sendText(env, chatId, "Applying now — new cut lands here in a few minutes.");
+  const clips = Array.isArray(pending?.clips) ? pending.clips : [];
+  await dispatch(env, {
+    kind: "fix-apply",
+    chat_id: chatId,
+    state_ref: pending.state_ref,
+    instruction: "",
+    ...(clips.length ? { clips: JSON.stringify(clips) } : {}),
+  });
+  await consumeClips(env, chatId, clips);
 }
 
 async function deliverRef(env, chatId, refHint) {
@@ -824,15 +929,8 @@ async function handleCallback(cb, env) {
       await answerCallback(env, cb.id, "that preview expired — make the edit again");
       return;
     }
-    await clearPendingConfirm(env, chatId);
     await answerCallback(env, cb.id, "Applying — new cut in a few minutes");
-    await sendText(env, chatId, "Applying now — new cut lands here in a few minutes.");
-    await dispatch(env, {
-      kind: "fix-apply",
-      chat_id: chatId,
-      state_ref: ref,
-      instruction: "",
-    });
+    await dispatchApply(env, chatId, pending);
     return;
   }
   if (tag === "reject" && parts.length === 2) {
@@ -1052,7 +1150,7 @@ async function runStatus(env, chatId) {
 async function ensureBotCommands(env) {
   try {
     if (!env.PENDING_IMAGES) return;
-    if (await env.PENDING_IMAGES.get("botcmd:v2")) return;
+    if (await env.PENDING_IMAGES.get("botcmd:v3")) return;
     const resp = await fetch(
       `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setMyCommands`,
       {
@@ -1062,7 +1160,7 @@ async function ensureBotCommands(env) {
       },
     );
     if (!resp.ok) return; // retry on a later message; errors stay silent
-    await env.PENDING_IMAGES.put("botcmd:v2", "1", { expirationTtl: CMD_REG_TTL });
+    await env.PENDING_IMAGES.put("botcmd:v3", "1", { expirationTtl: CMD_REG_TTL });
   } catch {
     // menu registration is conveniences-only
   }
@@ -1142,6 +1240,97 @@ async function clearVideo(env, chatId) {
       // staging is best-effort; the TTL cleans up regardless
     }
   }
+}
+
+// Inserted clips staged for the next build (or the next insert edit).
+// Entries: {id, file_id, at, duration, trim_start, muted, fit, label, source_dur}
+function clipsKey(chatId) {
+  return `pending_clips:${chatId}`;
+}
+
+function clipModeKey(chatId) {
+  return `clip_mode:${chatId}`;
+}
+
+async function getClips(env, chatId) {
+  try {
+    if (!env.PENDING_IMAGES) return [];
+    const raw = await env.PENDING_IMAGES.get(clipsKey(chatId));
+    const list = JSON.parse(raw || "[]");
+    if (!Array.isArray(list)) return [];
+    return list.filter((c) => c && typeof c.file_id === "string");
+  } catch {
+    return [];
+  }
+}
+
+async function saveClips(env, chatId, list) {
+  if (!env.PENDING_IMAGES) return;
+  if (!list.length) {
+    await env.PENDING_IMAGES.delete(clipsKey(chatId));
+    return;
+  }
+  await env.PENDING_IMAGES.put(clipsKey(chatId), JSON.stringify(list), {
+    expirationTtl: 3600,
+  });
+}
+
+async function pushClip(env, chatId, clip) {
+  const list = await getClips(env, chatId);
+  list.push(clip);
+  await saveClips(env, chatId, list);
+  return list.length;
+}
+
+async function takeClips(env, chatId) {
+  const list = await getClips(env, chatId);
+  if (list.length) await saveClips(env, chatId, []);
+  return list;
+}
+
+// Clips already turned into an applied edit; later refinements reuse the copy
+// stored in the run state, so drop the staged originals to avoid re-inserting.
+async function consumeClips(env, chatId, used) {
+  if (!Array.isArray(used) || !used.length) return;
+  const usedIds = new Set(used.map((c) => String(c.id || "")));
+  const rest = (await getClips(env, chatId)).filter(
+    (c) => !usedIds.has(String(c.id || "")),
+  );
+  await saveClips(env, chatId, rest);
+}
+
+async function setClipMode(env, chatId) {
+  try {
+    if (env.PENDING_IMAGES) {
+      await env.PENDING_IMAGES.put(clipModeKey(chatId), "1", {
+        expirationTtl: 900,
+      });
+    }
+  } catch {
+    // best-effort: the source-staged rule still routes clips correctly
+  }
+}
+
+async function getClipMode(env, chatId) {
+  try {
+    if (!env.PENDING_IMAGES) return false;
+    return Boolean(await env.PENDING_IMAGES.get(clipModeKey(chatId)));
+  } catch {
+    return false;
+  }
+}
+
+async function clearClipMode(env, chatId) {
+  try {
+    if (env.PENDING_IMAGES) await env.PENDING_IMAGES.delete(clipModeKey(chatId));
+  } catch {
+    // best-effort
+  }
+}
+
+async function clearClips(env, chatId) {
+  await clearClipMode(env, chatId);
+  await saveClips(env, chatId, []);
 }
 
 // ---- GPT-style talk: dialogue memory, pending confirms, state lookup ----
@@ -1302,15 +1491,18 @@ async function askTalker(env, ctx) {
       last_state: ctx.lastState,
       reply_ref: ctx.replyRef,
     }) +    "\n\nYou CAN ask the pipeline to: cut/keep spans, place/move/remove/resize images, " +
-    "recaption, add/remove zooms, replace icons. Times the user gives mean the " +
-    "ORIGINAL uploaded video; the pipeline shows both clocks at confirm time — " +
-    "never convert or second-guess times.\n" +
+    "recaption, add/remove zooms, replace icons, and insert/move/trim/remove " +
+    "video clips (with their own audio, or muted), or switch a clip between " +
+    "fill-the-reel and blur-fit. A video clip must be sent to the bot first " +
+    "(`/addvideo`); if none is staged and the edit needs one, ask them to send " +
+    "it. Times the user gives mean the ORIGINAL uploaded video; the pipeline " +
+    "shows both clocks at confirm time - never convert or second-guess times.\n" +
     "The pipeline already transcribed the FULL video — every spoken word with " +
     "timestamps lives in the plan. NEVER ask the user to send or provide the " +
     "transcript. To place something 'where I talk about X': proceed to preview " +
     "(the planner maps phrases to words); if nothing matches, ask for a TIME, " +
     "never the transcript.\n" +
-    "You CANNOT: music, effects, new footage, speed changes, caption styling. " +
+    "You CANNOT: music, effects, speed changes, caption styling. " +
     "Say so plainly and offer the closest alternative.\n\n" +
     "Decide ONE action, reply with raw JSON only:\n" +
     '{"action": "chat|fix|yes|no|adjust|deliver", ' +
@@ -1436,7 +1628,7 @@ function parsePlacement(caption, fallbackLabel) {
   return { start, end, label };
 }
 
-function buildPrompt(base, imgs) {
+function buildPrompt(base, imgs, clips = []) {
   const lines = imgs.map((im, k) => {
     const p = parsePlacement(im.note || "", `image ${k + 1}`);
     const when =
@@ -1447,11 +1639,62 @@ function buildPrompt(base, imgs) {
           : `${fmtTime(p.start)}–${fmtTime(p.end)}`;
     return `- image-${k + 1} (${p.label}): ${when}`;
   });
-  if (!lines.length) return base;
-  return (
-    `${base}\n\nStaged images ` +
-    `(attachments image-1..image-${imgs.length}, match by name stem):\n${lines.join("\n")}`
-  );
+  const clipLines = clips.map((c, k) => {
+    const when = c.at == null ? "at the start" : `from ${fmtTime(c.at)}`;
+    const len = c.duration == null ? "default length" : `${c.duration}s`;
+    const mute = c.muted ? ", muted" : "";
+    return `- clip ${k + 1} (${c.label || c.id}): ${when}, ${len}${mute}`;
+  });
+  const blocks = [];
+  if (lines.length) {
+    blocks.push(
+      `Staged images (attachments image-1..image-${imgs.length}, match by name stem):\n${lines.join("\n")}`,
+    );
+  }
+  if (clipLines.length) {
+    blocks.push(
+      `Inserted video clips (insert in this order, keep these placements):\n${clipLines.join("\n")}`,
+    );
+  }
+  if (!blocks.length) return base;
+  return `${base}\n\n${blocks.join("\n\n")}`;
+}
+
+// Clip caption -> {at, duration, trim_start, muted, fit, label}. Supports
+// `at 0:20`, `for 5s`, `from 0:03 for 8s`, `mute`, `fill`/`blur-fit`.
+function parseClipCaption(caption, fallbackLabel) {
+  const text = String(caption || "");
+  const time = String.raw`(\d+:\d{1,2}|\d+(?:\.\d+)?\s*s(?:ec(?:ond)?s?)?|\d+\s*m(?:in(?:ute)?s?)?(?:\s*\d+\s*s)?)`;
+  const fromM = text.match(new RegExp(String.raw`\bfrom\s+${time}\b`, "i"));
+  const durM = text.match(/\bfor\s+(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?\b/i);
+  const atM = text.match(new RegExp(String.raw`\b(?:at|@)\s*${time}\b`, "i"));
+  let cleaned = text;
+  for (const m of [fromM, durM, atM]) {
+    if (m) cleaned = cleaned.replace(m[0], " ");
+  }
+  const p = parsePlacement(cleaned, fallbackLabel);
+  return {
+    at: atM ? parseClock(atM[1]) : p.start,
+    duration: durM ? Number(durM[1]) : null,
+    trim_start: fromM ? parseClock(fromM[1]) : 0,
+    muted: /\b(mute|muted|no audio|silent)\b/i.test(text),
+    fit: /\b(fill|cover)\b/i.test(text)
+      ? "cover"
+      : /\b(blur|fit)\b/i.test(text)
+        ? "adaptive"
+        : null,
+    label: p.label,
+  };
+}
+
+function parseClock(token) {
+  const text = String(token || "").trim();
+  const mmss = text.match(/^(\d+):(\d{1,2})$/);
+  if (mmss) return Number(mmss[1]) * 60 + Number(mmss[2]);
+  const mins = text.match(/^(\d+)\s*m(?:in(?:ute)?s?)?(?:\s*(\d+(?:\.\d+)?)\s*s)?$/i);
+  if (mins) return Number(mins[1]) * 60 + (mins[2] ? Number(mins[2]) : 0);
+  const secs = text.match(/^(\d+(?:\.\d+)?)\s*s(?:ec(?:ond)?s?)?$/i);
+  return secs ? Number(secs[1]) : 0;
 }
 
 function normalizedInputs(inputs) {
@@ -1461,6 +1704,7 @@ function normalizedInputs(inputs) {
     url: "",
     video_file_id: "",
     attachments: "[]",
+    clips: "[]",
     prompt: "",
     state_ref: "",
     instruction: "",

@@ -89,6 +89,44 @@ class Visual(BaseModel):
         return self
 
 
+def insert_anchor(ins: Insert, words: list[Word], segments: list[Segment]) -> float:
+    """Source time where a clip starts: before its word, or at a segment edge.
+
+    A clip anchored to a segment's first kept word starts when that segment
+    starts (i.e. before its pre-roll), so the boundary has a hard cut instead of
+    crossfading under the clip.
+    """
+    if ins.from_word < len(words):
+        for seg in segments:
+            if seg.keep_from_word == ins.from_word:
+                return seg.start
+        return words[ins.from_word].s
+    return segments[-1].end
+
+
+class Insert(BaseModel):
+    """A clip inserted into the reel at a word boundary (source time).
+
+    `file` is relative to the run state directory (e.g. inserts/clip-1.mp4).
+    `duration` is already resolved to the clip length available after
+    `trim_start`; the renderer trims and does not guess.
+    """
+
+    id: str
+    file: str
+    from_word: int = Field(ge=0)  # clip starts BEFORE this word (n = end)
+    trim_start: float = Field(default=0.0, ge=0)
+    duration: float = Field(gt=0)
+    muted: bool = False
+    fit: Literal["adaptive", "cover"] = "adaptive"
+
+    @model_validator(mode="after")
+    def _check(self) -> Insert:
+        if not self.file:
+            raise ValueError(f"{self.id}: insert needs a file")
+        return self
+
+
 class CaptionSpan(BaseModel):
     from_word: int = Field(ge=0)
     to_word: int = Field(ge=0)
@@ -125,6 +163,7 @@ class EditPlan(BaseModel):
     reframe: Reframe
     words: list[Word]
     segments: list[Segment]
+    inserts: list[Insert] = Field(default_factory=list)
     visuals: list[Visual] = Field(default_factory=list)
     captions: list[CaptionSpan] = Field(default_factory=list)
     zoom_at_words: list[int] = Field(default_factory=list)
@@ -161,12 +200,20 @@ class EditPlan(BaseModel):
             require_single_segment(cap.from_word, cap.to_word, "caption")
         for v in self.visuals:
             require_single_segment(v.from_word, v.to_word, f"visual {v.id}")
+        for ins in self.inserts:
+            if not 0 <= ins.from_word <= n:
+                raise ValueError(f"insert {ins.id}: from_word out of bounds")
+            if ins.from_word < n and ins.from_word not in word_segment:
+                raise ValueError(f"insert {ins.id}: word {ins.from_word} was cut out")
         for zi in self.zoom_at_words:
             if not 0 <= zi < n:
                 raise ValueError(f"zoom word {zi} out of bounds")
         ids = [v.id for v in self.visuals]
         if len(ids) != len(set(ids)):
             raise ValueError("duplicate visual ids")
+        insert_ids = [i.id for i in self.inserts]
+        if len(insert_ids) != len(set(insert_ids)):
+            raise ValueError("duplicate insert ids")
         return self
 
     def segment_of_word(self, wi: int) -> int:
@@ -174,6 +221,10 @@ class EditPlan(BaseModel):
             if seg.keep_from_word <= wi <= seg.keep_to_word:
                 return si
         raise KeyError(f"word {wi} not in any segment")
+
+    def insert_anchor_s(self, ins: Insert) -> float:
+        """Source timestamp where the clip begins (before `from_word`)."""
+        return insert_anchor(ins, self.words, self.segments)
 
 
 # ---- LLM draft output (what gemini-3.5-flash returns) ----
@@ -226,6 +277,12 @@ class FixOp(str, Enum):
     resize_visual = "resize_visual"
     set_visual_mode = "set_visual_mode"
     set_preset = "set_preset"
+    insert_video = "insert_video"
+    retime_insert = "retime_insert"
+    trim_insert = "trim_insert"
+    remove_insert = "remove_insert"
+    set_insert_fit = "set_insert_fit"
+    set_insert_audio = "set_insert_audio"
     unknown = "unknown"
 
 
@@ -241,6 +298,11 @@ class FixPatch(BaseModel):
     mode: Literal["cover", "adaptive", "fit", "overlay"] | None = None
     crop_focus: Literal["top", "center", "bottom"] | None = None
     preset: str | None = None
+    insert_id: str | None = None
+    duration: float | None = Field(default=None, gt=0)
+    trim_start: float | None = Field(default=None, ge=0)
+    muted: bool | None = None
+    fit: Literal["adaptive", "cover"] | None = None
     note: str | None = None
 
 

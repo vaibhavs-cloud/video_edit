@@ -34,9 +34,12 @@ re-plans.
 |---|---|
 | `/new` + video link or upload | stage a new video |
 | `/addimage` + photo | stage an image (label + time optional in the caption, e.g. `pyramid at 0:20`) |
+| `/addvideo` + clip | stage an inserted video clip (caption: `at 0:20 for 5s`, `from 0:03`, `mute`) |
 | `/build` or `done` | start the edit run |
 | `/cut 0:30 0:45`, `/keep 0:10 1:00` | remove / keep only a span |
 | `/place image 3 at 0:20` | attach staged image at a time |
+| `/place video 1 at 0:20 for 5s` | insert a staged clip (default 10s, own audio, adaptive fit) |
+| `/move video 1 to 0:40`, `/remove video 1` | retime / drop an inserted clip |
 | `/size image 3 60%` (or `bigger`) | resize an overlay |
 | `/recaption image 3 Crunchy build` | reword an overlay label text |
 | `/preset punchy` | audio recipe (`clean_voice` / `punchy` / `flat`; noise cancelling always stays on) |

@@ -21,13 +21,19 @@ from vedit.schema import (
     DraftCaption,
     DraftVisual,
     EditPlan,
+    Insert,
     PlanDraft,
     Reframe,
     Segment,
     Transcript,
     Visual,
 )
-from vedit.stage.anchor import AnchorError, parse_time_tokens, resolve_span
+from vedit.stage.anchor import (
+    AnchorError,
+    parse_time_tokens,
+    resolve_point,
+    resolve_span,
+)
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -239,6 +245,75 @@ def _owner_placements(
     return notes
 
 
+def _build_inserts(
+    clips: list[dict],
+    transcript: Transcript,
+    segments: list[Segment],
+    cfg: Config,
+) -> tuple[list[Insert], list[str]]:
+    """Resolve staged clip metadata into word-anchored Insert models."""
+    notes: list[str] = []
+    inserts: list[Insert] = []
+    for idx, clip in enumerate(clips, start=1):
+        cid = str(clip.get("id") or f"clip-{idx}")
+        src = str(clip.get("file") or "")
+        if not src:
+            notes.append(f"dropped {cid}: no downloaded file")
+            continue
+        try:
+            trim = max(0.0, float(clip.get("trim_start") or 0.0))
+            source_dur = float(clip.get("source_dur") or 0.0)
+            requested = clip.get("duration")
+            dur = (
+                float(requested)
+                if requested not in (None, "")
+                else cfg.inserts.default_s
+            )
+        except (TypeError, ValueError):
+            notes.append(f"dropped {cid}: bad clip metadata")
+            continue
+        dur = min(dur, cfg.inserts.max_s)
+        if source_dur > 0:
+            dur = min(dur, max(0.0, source_dur - trim))
+        if dur <= 0.25:
+            notes.append(f"dropped {cid}: no usable duration after trim")
+            continue
+        at = clip.get("at")
+        try:
+            wi = resolve_point(
+                0.0 if at in (None, "") else float(at), transcript.words, segments
+            )
+        except (AnchorError, TypeError, ValueError):
+            notes.append(f"dropped {cid}: placement time not anchorable")
+            continue
+        fit = str(clip.get("fit") or cfg.inserts.fit)
+        if fit not in ("adaptive", "cover"):
+            fit = cfg.inserts.fit
+        muted = clip.get("muted")
+        muted = bool(muted) if muted is not None else not cfg.inserts.audio
+        try:
+            inserts.append(
+                Insert(
+                    id=cid,
+                    file=src,
+                    from_word=wi,
+                    trim_start=trim,
+                    duration=round(dur, 3),
+                    muted=muted,
+                    fit=fit,
+                )
+            )
+        except ValidationError as exc:
+            notes.append(f"dropped {cid}: {exc.errors()[0]['msg']}")
+            continue
+        anchor_s = transcript.words[wi].s
+        notes.append(
+            f"insert {cid}: at {anchor_s:.1f}s (word {wi}), "
+            f"{dur:.1f}s{' muted' if muted else ''}"
+        )
+    return inserts, notes
+
+
 def assemble_plan(
     draft: PlanDraft,
     transcript: Transcript,
@@ -248,6 +323,7 @@ def assemble_plan(
     source_meta: dict,
     degraded: bool,
     note: str,
+    clips: list[dict] | None = None,
 ) -> tuple[EditPlan, list[str]]:
     """Deterministically sanitises draft output into a validated EditPlan.
 
@@ -351,6 +427,9 @@ def assemble_plan(
     max_zoom = max(1, len(segments) // cfg.video.max_zoom_segments_div)
     zooms = zooms[:max_zoom]
 
+    inserts, insert_notes = _build_inserts(clips or [], transcript, segments, cfg)
+    notes.extend(insert_notes)
+
     aspect = source_meta["w"] / source_meta["h"]
     plan = EditPlan(
         source={
@@ -367,6 +446,7 @@ def assemble_plan(
         ),
         words=transcript.words,
         segments=segments,
+        inserts=inserts,
         visuals=visuals,
         captions=captions,
         zoom_at_words=zooms,

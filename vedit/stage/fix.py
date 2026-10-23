@@ -22,12 +22,13 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from vedit import ff
-from vedit.config import Config
+from vedit.config import Config, InsertCfg
 from vedit.llm import generate_json, make_client, missing_key
 from vedit.schema import (
     EditPlan,
     FixOp,
     FixPatch,
+    Insert,
     Segment,
     Transcript,
     Visual,
@@ -62,8 +63,11 @@ SUPPORTED = (
     '("keep only 0:10 to 1:00") · add/remove a zoom ("zoom in at 0:30") · '
     'resize an overlay ("make the image smaller", "shrink it to 60%") · '
     'image display ("make the image 2 fill the reel", "blur-fit image 2", '
-    '"/editimage 2" for the menu) · audio recipe ("/preset clean_voice, '
-    'punchy or flat — noise cancelling is always on"). '
+    '"/editimage 2" for the menu) · inserted video ("put video 1 at 0:20 '
+    'for 5s", "move the inserted video later", "trim it to 3s", '
+    '"remove video 1", "blur-fit the inserted video", "mute it") · audio '
+    'recipe ("/preset clean_voice, punchy or flat — noise cancelling is '
+    "always on). "
     "Silence cutting is automatic — report surviving pauses and the cut "
     "settings get tuned instead."
 )
@@ -109,11 +113,55 @@ def _caption_rows(plan: EditPlan, transcript: Transcript) -> list[dict]:
     return rows
 
 
+def _insert_rows(plan: EditPlan, transcript: Transcript) -> list[dict]:
+    rows = []
+    for i, ins in enumerate(plan.inserts, start=1):
+        anchor = (
+            transcript.words[ins.from_word].s
+            if ins.from_word < len(transcript.words)
+            else plan.segments[-1].end
+        )
+        rows.append(
+            {
+                "id": ins.id,
+                "video": i,
+                "from_word": ins.from_word,
+                "from_s": round(anchor, 2),
+                "duration_s": round(ins.duration, 2),
+                "trim_start_s": round(ins.trim_start, 2),
+                "muted": ins.muted,
+                "fit": ins.fit,
+                "file": ins.file,
+            }
+        )
+    return rows
+
+
+def _clip_rows(clips: list[dict]) -> list[dict]:
+    rows = []
+    for i, clip in enumerate(clips, start=1):
+        rows.append(
+            {
+                "id": clip.get("id") or f"clip-{i}",
+                "file": clip.get("file"),
+                "label": clip.get("label") or "",
+                "at_s": clip.get("at"),
+                "duration_s": clip.get("duration"),
+                "source_dur_s": clip.get("source_dur"),
+                "trim_start_s": clip.get("trim_start") or 0,
+                "muted": clip.get("muted"),
+                "fit": clip.get("fit"),
+            }
+        )
+    return rows
+
+
 def _build_prompt(
     instruction: str,
     plan: EditPlan,
     transcript: Transcript,
     screenshots: list[str],
+    clips: list[dict] | None = None,
 ) -> str:
     return f"""You map ONE correction instruction to a single structured patch op.
 
@@ -130,7 +178,13 @@ OPS (pick exactly one):
 - set_visual_mode: change HOW an image fills the frame; set visual_id + mode ("cover" = crop to fill the reel, "adaptive" = full image visible on a blurred backdrop, "overlay" = floating smaller box) + optional crop_focus ("top"/"center"/"bottom" for cover). E.g. "make the image 2 fill the reel" -> mode cover, "blur-fit the image" -> mode adaptive, "show the picture as a small floating box" -> mode overlay.
 - set_preset: change the audio recipe; set text = the preset name given by the owner ("clean_voice", "punchy", "flat"). Noise cancelling always stays on. E.g. "use the clean_voice preset".
 - add_visual: place an input image; set file (exactly one of AVAILABLE SCREENSHOTS) + from_word + to_word (source word indices, inside one segment; an explicit time in the instruction is matched exactly to the transcript by code). If the instruction says to add the image without naming one, omit file and the first available screenshot is used. If it names no time or words, omit from_word/to_word and the image goes near the start (it can be retimed after).
-- unknown: the instruction is not about visuals or captions at all
+- insert_video: insert a staged video clip; set file to the clip id/file from AVAILABLE CLIPS (or "video N" for the Nth clip) + optional from_word (start word, resolved from the named time) + optional duration (seconds) + muted (true = drop the clip's audio) + fit ("adaptive" = full clip visible on a blurred backdrop, "cover" = crop to fill the reel). E.g. "put video 1 at 0:20 for 5s". If the clip is already in CURRENT INSERTS and the owner only wants to move it, use retime_insert instead.
+- retime_insert: move an existing inserted clip to a new time; set insert_id + from_word (source word index; resolved from the named time). E.g. "no not here, push the inserted video later", "move video 1 to 0:40".
+- trim_insert: change an inserted clip's used span; set insert_id + duration (seconds, first N seconds) and/or trim_start (skip seconds from the clip start). E.g. "trim the inserted video to 3s", "start the clip 2s in".
+- remove_insert: drop an inserted clip from the reel; set insert_id. E.g. "remove the inserted video", "take out video 1".
+- set_insert_fit: change how an inserted clip fills the frame; set insert_id + fit ("cover" = fill/crop, "adaptive" = full clip visible on a blurred backdrop). E.g. "make the inserted video fill the screen" -> cover, "blur-fit video 1" -> adaptive.
+- set_insert_audio: mute or unmute an inserted clip; set insert_id + muted (true = mute). E.g. "mute the inserted video", "bring back the clip's sound".
+- unknown: the instruction is not about visuals, captions or inserted videos at all
 
 TARGETING: when the instruction names a time or describes a position, pick the
 CLOSEST visual / caption to it — exact matches are not required. Only answer
@@ -141,6 +195,8 @@ TIME MAP: each word is [index](start-end seconds). Times in the instruction refe
 
 CURRENT VISUALS: {json.dumps(_visual_rows(plan, transcript), ensure_ascii=False)}
 CURRENT CAPTIONS: {json.dumps(_caption_rows(plan, transcript), ensure_ascii=False)}
+CURRENT INSERTS: {json.dumps(_insert_rows(plan, transcript), ensure_ascii=False)}
+AVAILABLE CLIPS: {json.dumps(_clip_rows(clips or []), ensure_ascii=False)}
 AVAILABLE SCREENSHOTS: {json.dumps(screenshots, ensure_ascii=False)}
 WORDS: {_words_inline(transcript)}
 
@@ -175,6 +231,67 @@ def _find_visual_ref(plan: EditPlan, ref: str | None) -> Visual:
     )
 
 
+def _find_insert(plan: EditPlan, patch: FixPatch) -> Insert:
+    """Insert by plan id or bot numbering ("video 2" = second insert)."""
+    ref = (patch.insert_id or "").strip()
+    if ref:
+        for ins in plan.inserts:
+            if ins.id == ref:
+                return ins
+        m = re.match(r"(?i)^(?:video|clip|insert)-?(\d+)$", ref)
+        if m:
+            idx = int(m.group(1)) - 1
+            if 0 <= idx < len(plan.inserts):
+                return plan.inserts[idx]
+        for ins in plan.inserts:
+            if Path(ins.file).stem == ref:
+                return ins
+    raise FixError(
+        f"no inserted video '{ref}' in this plan "
+        f"(have: {', '.join(i.id for i in plan.inserts) or 'none'})"
+    )
+
+
+def _resolve_clip(plan: EditPlan, clips: list[dict], ref: str | None) -> dict:
+    """Staged clip by id/file/"video N"; whichever clip is not inserted yet."""
+    if not clips:
+        raise FixError(
+            "no video clips staged — send the clip to the bot first, "
+            "then say where it should go"
+        )
+    if ref:
+        text = str(ref)
+        m = re.match(r"(?i)^(?:video|clip|insert)-?(\d+)$", text)
+        if m:
+            idx = int(m.group(1)) - 1
+            if 0 <= idx < len(clips):
+                return clips[idx]
+        for clip in clips:
+            base = Path(str(clip.get("file") or "")).stem
+            if text in (str(clip.get("id")), str(clip.get("file")), base):
+                return clip
+    inserted = {Path(i.file).name for i in plan.inserts}
+    fresh = [c for c in clips if Path(str(c.get("file") or "")).name not in inserted]
+    pool = fresh or clips
+    if len(pool) == 1:
+        return pool[0]
+    listing = ", ".join(
+        f"{c.get('id') or f'clip-{i}'}" for i, c in enumerate(clips, start=1)
+    )
+    raise FixError(f"say which video to insert (available: {listing})")
+
+
+def _clip_source_dur(clips: list[dict], file: str) -> float | None:
+    for clip in clips:
+        if str(clip.get("file") or "") == file:
+            try:
+                value = float(clip.get("source_dur") or 0)
+            except (TypeError, ValueError):
+                return None
+            return value if value > 0 else None
+    return None
+
+
 def parse_directive(instruction: str, plan: EditPlan) -> FixPatch | None:
     """Machine-readable syntax (slash commands / menus) — parsed without the LLM.
 
@@ -185,6 +302,30 @@ def parse_directive(instruction: str, plan: EditPlan) -> FixPatch | None:
     m = re.match(r"(?i)^preset\s+([a-z][\w-]{0,30})$", t)
     if m:
         return FixPatch(op=FixOp.set_preset, text=m.group(1).lower())
+    ref = r"((?:video|clip|insert)\s*\d+|\S+)"
+    m = re.match(rf"(?i)^insert_video\s+{ref}(?:\s+.*)?$", t)
+    if m:
+        return FixPatch(op=FixOp.insert_video, file=m.group(1))
+    m = re.match(rf"(?i)^retime_insert\s+{ref}(?:\s+.*)?$", t)
+    if m:
+        return FixPatch(op=FixOp.retime_insert, insert_id=m.group(1))
+    m = re.match(rf"(?i)^trim_insert\s+{ref}(?:\s+.*)?$", t)
+    if m:
+        return FixPatch(op=FixOp.trim_insert, insert_id=m.group(1))
+    m = re.match(rf"(?i)^remove_insert\s+{ref}$", t)
+    if m:
+        return FixPatch(op=FixOp.remove_insert, insert_id=m.group(1))
+    m = re.match(rf"(?i)^set_insert_fit\s+{ref}\s+(cover|adaptive|fill|blur)$", t)
+    if m:
+        fit = "cover" if m.group(2).lower() in ("cover", "fill") else "adaptive"
+        return FixPatch(op=FixOp.set_insert_fit, insert_id=m.group(1), fit=fit)
+    m = re.match(rf"(?i)^set_insert_audio\s+{ref}\s+(mute|unmute)$", t)
+    if m:
+        return FixPatch(
+            op=FixOp.set_insert_audio,
+            insert_id=m.group(1),
+            muted=m.group(2).lower() == "mute",
+        )
     m = re.match(
         r"(?i)^set_visual_mode\s+(\S+)\s+(cover|adaptive|fit|overlay)"
         r"(?:\s+crop\s+(top|center|bottom))?$",
@@ -232,9 +373,19 @@ def parse_directive(instruction: str, plan: EditPlan) -> FixPatch | None:
     return None
 
 
-def _mock_patch(instruction: str, plan: EditPlan, screenshots: list[str]) -> FixPatch:
+def _mock_patch(
+    instruction: str,
+    plan: EditPlan,
+    screenshots: list[str],
+    clips: list[dict] | None = None,
+) -> FixPatch:
     text = instruction.lower()
     first_icon = next((v for v in plan.visuals if v.kind == "icon"), None)
+    if clips and ("insert" in text or "add video" in text or "put video" in text):
+        return FixPatch(
+            op=FixOp.insert_video,
+            file=str(clips[0].get("id") or clips[0].get("file")),
+        )
     if "remove the zoom" in text or "unzoom" in text:
         c = plan.captions[0] if plan.captions else None
         return FixPatch(
@@ -348,6 +499,39 @@ def _salvage_op(instruction: str, patch: FixPatch, plan: EditPlan) -> FixPatch:
     return patch
 
 
+_SECS_TOKEN = re.compile(
+    r"(?<!\d)(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b", re.IGNORECASE
+)
+
+
+def _duration_from_text(text: str) -> float | None:
+    """Seconds named for a clip ("for 5s", "make it 3 seconds"), not a position."""
+    explicit = re.search(
+        r"\b(?:for|to|last(?:ing)?|length(?:\s+of)?)\s+"
+        r"(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b",
+        text or "",
+        re.IGNORECASE,
+    )
+    if explicit:
+        return float(explicit.group(1))
+    for m in _SECS_TOKEN.finditer(text or ""):
+        prefix = (text or "")[max(0, m.start() - 24) : m.start()].lower()
+        if re.search(r"(?:from|start(?:ing)?(?:\s+at)?|skip(?:ping)?)\s*$", prefix):
+            continue
+        return float(m.group(1))
+    return None
+
+
+def _trim_start_from_text(text: str) -> float | None:
+    m = re.search(
+        r"\b(?:from|start(?:ing)?(?:\s+at)?|skip(?:ping)?)\s+"
+        r"(\d+(?:\.\d+)?)\s*(?:s|sec|secs|second|seconds)\b",
+        text or "",
+        re.IGNORECASE,
+    )
+    return float(m.group(1)) if m else None
+
+
 def _apply_time_anchor(
     patch: FixPatch,
     instruction: str,
@@ -409,8 +593,20 @@ def _apply_time_anchor(
             v = _nearest_visual(plan, pt)
             if v is not None:
                 patch.visual_id = v.id
+        elif patch.op == FixOp.insert_video:
+            if patch.from_word is None:
+                patch.from_word = resolve_point(tokens[0], words, plan.segments)
+        elif patch.op == FixOp.retime_insert:
+            patch.from_word = resolve_point(tokens[-1], words, plan.segments)
     except AnchorError:
         pass
+    if patch.op == FixOp.trim_insert:
+        if patch.duration is None:
+            patch.duration = _duration_from_text(instruction)
+        if patch.trim_start is None:
+            patch.trim_start = _trim_start_from_text(instruction)
+    if patch.op == FixOp.insert_video and patch.duration is None:
+        patch.duration = _duration_from_text(instruction)
     return patch
 
 
@@ -421,6 +617,7 @@ def parse_fix(
     cfg: Config,
     mock: bool = False,
     screenshots: list[str] | None = None,
+    clips: list[dict] | None = None,
 ) -> FixPatch:
     """Map free text to a FixPatch. Raises FixError only when the model fails."""
     shots = screenshots or []
@@ -429,7 +626,7 @@ def parse_fix(
     if directive is not None:
         return _apply_time_anchor(directive, instruction, plan, transcript, span_s)
     if mock:
-        patch = _mock_patch(instruction, plan, shots)
+        patch = _mock_patch(instruction, plan, shots, clips)
         return _apply_time_anchor(patch, instruction, plan, transcript, span_s)
     key = missing_key(cfg)
     if key:
@@ -437,7 +634,7 @@ def parse_fix(
 
     from vedit.stage.plan import _strip_fences
 
-    prompt = _build_prompt(instruction, plan, transcript, shots)
+    prompt = _build_prompt(instruction, plan, transcript, shots, clips)
     client = make_client(cfg)
     last: Exception | None = None
     patch: FixPatch | None = None
@@ -588,6 +785,22 @@ def _repair_cut(plan: EditPlan, lo: int, hi: int, notes: list[str]) -> None:
                     c.override_text = None
             c.from_word, c.to_word = kept
             c.emphasis = [e for e in c.emphasis if kept[0] <= e <= kept[1]]
+    for ins in list(plan.inserts):
+        if not lo <= ins.from_word <= hi:
+            continue
+        try:
+            new_word = resolve_point(
+                plan.words[ins.from_word].s, plan.words, plan.segments
+            )
+        except AnchorError:
+            plan.inserts.remove(ins)
+            notes.append(f"cut dropped inserted video {ins.id} (no kept anchor)")
+            continue
+        ins.from_word = new_word
+        notes.append(
+            f"cut moved inserted video {ins.id} to word {new_word} "
+            f"({plan.words[new_word].s:.1f}s)"
+        )
     dropped = [z for z in plan.zoom_at_words if lo <= z <= hi]
     if dropped:
         plan.zoom_at_words = [z for z in plan.zoom_at_words if not lo <= z <= hi]
@@ -602,6 +815,8 @@ def apply_patch(
     screenshots: list[str] | None = None,
     max_zooms: int | None = None,
     presets: set[str] | None = None,
+    clips: list[dict] | None = None,
+    insert_cfg: InsertCfg | None = None,
 ) -> tuple[EditPlan, list[str]]:
     """Deterministically patch the plan. Raises FixError for anything unsafe."""
     notes: list[str] = []
@@ -818,6 +1033,130 @@ def apply_patch(
             )
         notes.append(f"fix: set_preset '{name}' — re-rendering audio with that recipe")
 
+    elif patch.op == FixOp.insert_video:
+        cfg = insert_cfg or InsertCfg()
+        target = _resolve_clip(plan, clips or [], patch.file)
+        src = str(target.get("file") or "")
+        if not src:
+            raise FixError("that clip was not downloaded — resend it")
+        trim = (
+            patch.trim_start
+            if patch.trim_start is not None
+            else float(target.get("trim_start") or 0.0)
+        )
+        requested = (
+            patch.duration
+            if patch.duration is not None
+            else float(target.get("duration") or cfg.default_s)
+        )
+        source_dur = _clip_source_dur(clips or [], src)
+        dur = min(requested, cfg.max_s)
+        if source_dur is not None:
+            dur = min(dur, max(0.0, source_dur - trim))
+        if dur <= 0.25:
+            raise FixError("that clip has no usable length after trimming")
+        w = patch.from_word
+        if w is None:
+            at = target.get("at")
+            w = resolve_point(
+                0.0 if at in (None, "") else float(at),
+                transcript.words,
+                plan.segments,
+            )
+        if not 0 <= w < n:
+            raise FixError(f"insert word {w} out of bounds (n={n})")
+        muted = patch.muted
+        if muted is None:
+            muted = target.get("muted")
+        if muted is None:
+            muted = not cfg.audio
+        fit = patch.fit or str(target.get("fit") or cfg.fit)
+        if fit not in ("adaptive", "cover"):
+            fit = cfg.fit
+        taken = {i.id for i in plan.inserts}
+        base_id = str(target.get("id") or "clip")
+        ins_id = base_id
+        counter = 2
+        while ins_id in taken:
+            ins_id = f"{base_id}-{counter}"
+            counter += 1
+        plan.inserts.append(
+            Insert(
+                id=ins_id,
+                file=src,
+                from_word=w,
+                trim_start=trim,
+                duration=round(dur, 3),
+                muted=bool(muted),
+                fit=fit,
+            )
+        )
+        notes.append(
+            f"fix: insert_video {ins_id} at word {w} "
+            f"({transcript.words[w].s:.1f}s), "
+            f"{dur:.1f}s{' muted' if muted else ''}, {fit}"
+        )
+
+    elif patch.op == FixOp.retime_insert:
+        ins = _find_insert(plan, patch)
+        if patch.from_word is None:
+            raise FixError("say where to move the inserted video (e.g. 'at 0:40')")
+        w = patch.from_word
+        if not 0 <= w < n:
+            raise FixError(f"insert word {w} out of bounds (n={n})")
+        try:
+            plan.segment_of_word(w)
+        except KeyError:
+            w = resolve_point(transcript.words[w].s, transcript.words, plan.segments)
+            notes.append(f"insert snapped to kept word {w}")
+        ins.from_word = w
+        notes.append(
+            f"fix: retime_insert {ins.id} -> word {w} ({transcript.words[w].s:.1f}s)"
+        )
+
+    elif patch.op == FixOp.trim_insert:
+        ins = _find_insert(plan, patch)
+        if patch.duration is None and patch.trim_start is None:
+            raise FixError("say how long (e.g. 'trim it to 3s')")
+        cfg = insert_cfg or InsertCfg()
+        trim = (
+            max(0.0, patch.trim_start)
+            if patch.trim_start is not None
+            else ins.trim_start
+        )
+        dur = patch.duration if patch.duration is not None else ins.duration
+        dur = min(dur, cfg.max_s)
+        source_dur = _clip_source_dur(clips or [], ins.file)
+        if source_dur is not None:
+            dur = min(dur, max(0.0, source_dur - trim))
+        if dur <= 0.25:
+            raise FixError("that trim leaves no usable clip")
+        ins.trim_start = trim
+        ins.duration = round(dur, 3)
+        notes.append(f"fix: trim_insert {ins.id} start {trim:.1f}s, {dur:.1f}s")
+
+    elif patch.op == FixOp.remove_insert:
+        ins = _find_insert(plan, patch)
+        plan.inserts.remove(ins)
+        notes.append(f"fix: remove_insert {ins.id}")
+
+    elif patch.op == FixOp.set_insert_fit:
+        ins = _find_insert(plan, patch)
+        if patch.fit is None:
+            raise FixError("say how it should fill the screen (fill or blur-fit)")
+        ins.fit = patch.fit
+        notes.append(f"fix: set_insert_fit {ins.id} -> {ins.fit}")
+
+    elif patch.op == FixOp.set_insert_audio:
+        ins = _find_insert(plan, patch)
+        if patch.muted is None:
+            raise FixError("say whether to mute or unmute the inserted video")
+        ins.muted = patch.muted
+        notes.append(
+            f"fix: set_insert_audio {ins.id} -> "
+            f"{'muted' if ins.muted else 'clip audio'}"
+        )
+
     try:
         validated = EditPlan.model_validate(plan.model_dump())
     except ValidationError as exc:
@@ -841,6 +1180,7 @@ def preview_fix(
     screenshots: list[str] | None = None,
     icons_enabled: bool = True,
     max_zooms: int | None = None,
+    clips: list[dict] | None = None,
 ) -> dict:
     """Dry-run a fix on a copy of the plan. Never mutates state.
 
@@ -850,7 +1190,7 @@ def preview_fix(
     confirmation-contract.md.
     """
     shots = screenshots or []
-    timeline = TimelineMap(plan.segments)
+    timeline = TimelineMap(plan.segments, plan.inserts, plan.words)
     before_dur = timeline.output_dur
     base = {
         "ok": False,
@@ -860,7 +1200,13 @@ def preview_fix(
     }
     try:
         patch = parse_fix(
-            instruction, plan, transcript, cfg, mock=mock, screenshots=shots
+            instruction,
+            plan,
+            transcript,
+            cfg,
+            mock=mock,
+            screenshots=shots,
+            clips=clips,
         )
     except FixError as exc:
         return {**base, "error": str(exc)}
@@ -874,6 +1220,8 @@ def preview_fix(
             shots,
             max_zooms,
             presets=set(cfg.audio.presets or {}),
+            clips=clips,
+            insert_cfg=cfg.inserts,
         )
     except FixError as exc:
         return {
@@ -891,6 +1239,25 @@ def preview_fix(
     }
     lo, hi = patch.from_word, patch.to_word
     words = transcript.words
+    if lo is not None and hi is None:
+        target_ins = None
+        if patch.op == FixOp.insert_video:
+            old_ids = {i.id for i in plan.inserts}
+            target_ins = next(
+                (i for i in new_plan.inserts if i.id not in old_ids), None
+            )
+        elif patch.op in (
+            FixOp.retime_insert,
+            FixOp.trim_insert,
+            FixOp.set_insert_fit,
+            FixOp.set_insert_audio,
+        ):
+            try:
+                target_ins = _find_insert(new_plan, patch)
+            except FixError:
+                target_ins = None
+        if target_ins is not None and target_ins.from_word < len(words):
+            lo = hi = target_ins.from_word
     if lo is not None and hi is not None and 0 <= lo <= hi < len(words):
         start_in, end_in = words[lo].s, words[hi].e
         preview["input_range_s"] = [round(start_in, 2), round(end_in, 2)]
@@ -910,10 +1277,15 @@ def preview_fix(
         "captions_after": len(new_plan.captions),
         "zooms_before": len(plan.zoom_at_words),
         "zooms_after": len(new_plan.zoom_at_words),
+        "inserts_before": len(plan.inserts),
+        "inserts_after": len(new_plan.inserts),
     }
     preview["duration"] = {
         "before_s": round(before_dur, 2),
-        "after_s": round(TimelineMap(new_plan.segments).output_dur, 2),
+        "after_s": round(
+            TimelineMap(new_plan.segments, new_plan.inserts, new_plan.words).output_dur,
+            2,
+        ),
     }
     return preview
 
@@ -940,6 +1312,10 @@ def confirmation_text(preview: dict) -> str:
     if aff.get("captions_before") != aff.get("captions_after"):
         extra.append(
             f"captions {aff.get('captions_before')}->{aff.get('captions_after')}"
+        )
+    if aff.get("inserts_before") != aff.get("inserts_after"):
+        extra.append(
+            f"inserted videos {aff.get('inserts_before')}->{aff.get('inserts_after')}"
         )
     dur = preview.get("duration", {})
     if dur and dur.get("before_s") != dur.get("after_s"):

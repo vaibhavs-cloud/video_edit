@@ -147,3 +147,11 @@ export:
     teaser: video             # video | document | none  (<=50MB chat copy)
     notify_gb: 9.0            # telegram nudge when bucket storage crosses this
     evict_gb: 9.5             # auto-delete least-recently-uploaded frees above this
+
+# Clips inserted into the reel ("put video 1 at 0:20"). Send videos with the
+# source; the first N seconds are used unless you ask for a trim ("for 5s").
+inserts:
+  default_s: 10
+  max_s: 120
+  audio: true              # keep the inserted clip's own sound
+  fit: adaptive            # adaptive = blurred backdrop + full clip | cover = crop

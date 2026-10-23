@@ -262,6 +262,30 @@ def s_cut(ctx: Ctx) -> None:
     _log(f"[cut] {len(segments)} segments, {kept:.1f}s kept of {probe['dur']:.1f}s")
 
 
+def _load_clips(ctx: Ctx) -> list[dict]:
+    """Staged inserted-clip metadata (inserts.json), with local durations filled."""
+    path = ctx.state / "inserts.json"
+    if not path.exists():
+        return []
+    clips = st.load_json(path)
+    if not isinstance(clips, list):
+        return []
+    out: list[dict] = []
+    for clip in clips:
+        if not isinstance(clip, dict):
+            continue
+        clip = dict(clip)
+        if not clip.get("source_dur"):
+            local = ctx.state / str(clip.get("file") or "")
+            if clip.get("file") and local.exists():
+                try:
+                    clip["source_dur"] = ff.probe(local)["dur"]
+                except Exception as exc:  # noqa: BLE001 - best-effort metadata
+                    _LOG.debug("could not probe %s: %s", local, exc)
+        out.append(clip)
+    return out
+
+
 def s_plan(ctx: Ctx) -> None:
     probe = st.load_json(ctx.state / "probe.json")
     meta = st.load_model(ctx.state / "meta.json", StateMeta)
@@ -297,13 +321,15 @@ def s_plan(ctx: Ctx) -> None:
         },
         degraded,
         note,
+        clips=_load_clips(ctx),
     )
     st.save_model(ctx.state / "edit_plan.json", plan)
     st.save_json(ctx.state / "notes.json", notes)
     degraded_note = f" (degraded: {note})" if degraded and note else ""
     _log(
         f"[plan] {len(plan.segments)} segments, {len(plan.visuals)} visuals, "
-        f"{len(plan.captions)} caption spans{degraded_note}"
+        f"{len(plan.captions)} caption spans, {len(plan.inserts)} inserts"
+        f"{degraded_note}"
     )
 
 
@@ -390,12 +416,24 @@ def s_render(ctx: Ctx) -> None:
     plan = _load_plan(ctx)
     resolved = _load_resolved(ctx)
     base = render.ensure_base(ctx.state / "source.mp4", plan, ctx.work, ctx.cfg)
-    segments = render.render_segments(
-        plan, resolved, base, ctx.work / "audio" / "clean_48k.wav", ctx.work, ctx.cfg
-    )
-    merged = render.concat_crossfade(segments, ctx.work, ctx.cfg)
+    clean_audio = ctx.work / "audio" / "clean_48k.wav"
+    if plan.inserts:
+        pieces = render.render_pieces(
+            plan, resolved, base, clean_audio, ctx.state, ctx.work, ctx.cfg
+        )
+        merged = render.assemble_pieces(pieces, ctx.work, ctx.cfg)
+        mains = sum(1 for p in pieces if p.kind == "main")
+        _log(
+            f"[render] final.mp4 ({mains} main pieces + "
+            f"{len(plan.inserts)} inserted clips)"
+        )
+    else:
+        segments = render.render_segments(
+            plan, resolved, base, clean_audio, ctx.work, ctx.cfg
+        )
+        merged = render.concat_crossfade(segments, ctx.work, ctx.cfg)
+        _log(f"[render] final.mp4 ({len(segments)} segments)")
     render.burn_captions(merged, ctx.work, FONTS_DIR, ctx.state / "final.mp4", ctx.cfg)
-    _log(f"[render] final.mp4 ({len(segments)} segments)")
 
 
 def s_qc(ctx: Ctx) -> None:
@@ -584,32 +622,102 @@ def _parse_file_ids(raw: str) -> list[str]:
     return [x.strip() for x in text.split(",") if x.strip()]
 
 
+def _parse_clips(raw: str) -> list[dict]:
+    """Inserted-clip specs from the worker (JSON array of objects)."""
+    import json as _json
+
+    text = (raw or "").strip()
+    if not text:
+        return []
+    try:
+        items = _json.loads(text)
+    except ValueError as exc:
+        raise SystemExit(f"bad --clips JSON: {exc}") from exc
+    if not isinstance(items, list):
+        raise SystemExit("bad --clips JSON: expected an array")
+    out: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        fid = item.get("file_id") or item.get("id")
+        if fid:
+            out.append({**item, "file_id": str(fid)})
+    return out
+
+
+def _attach_clips(state: Path, clips: list[dict], cfg: Config) -> None:
+    """Download inserted clips and merge their metadata into inserts.json."""
+    from vedit.telegram_client import Telegram
+
+    ins_dir = state / "inserts"
+    ins_dir.mkdir(parents=True, exist_ok=True)
+    meta_path = state / "inserts.json"
+    existing = st.load_json(meta_path) if meta_path.exists() else []
+    max_n = 0
+    for m in existing:
+        name = str(m.get("id") or "")
+        if name.startswith("clip-") and name[5:].isdigit():
+            max_n = max(max_n, int(name[5:]))
+    tg = Telegram()
+    for spec in clips:
+        explicit = str(spec.get("name") or "").strip()
+        if explicit.startswith("clip-") and explicit[5:].isdigit():
+            name = explicit
+        else:
+            max_n += 1
+            name = f"clip-{max_n}"
+        info = tg.resolve(spec["file_id"])
+        ext = Path(str(info.get("file_path") or "")).suffix.lower() or ".mp4"
+        fname = f"{name}{ext}"
+        dest = ins_dir / fname
+        tg.download(spec["file_id"], dest, cfg.limits.telegram_download_max_bytes)
+        entry = {
+            "id": name,
+            "file": f"inserts/{fname}",
+            "file_id": spec["file_id"],
+            "at": spec.get("at"),
+            "duration": spec.get("duration"),
+            "trim_start": spec.get("trim_start") or 0.0,
+            "muted": bool(spec.get("muted", not cfg.inserts.audio)),
+            "fit": spec.get("fit") or cfg.inserts.fit,
+            "label": spec.get("label") or "",
+            "source_dur": spec.get("source_dur"),
+        }
+        existing = [m for m in existing if m.get("id") != name]
+        existing.append(entry)
+        _log(f"[attach] {name} ({dest.stat().st_size} bytes)")
+
+
 def cmd_attach(args: argparse.Namespace) -> int:
-    """Download Telegram screenshot attachments into a run state (pre-process step)."""
+    """Download Telegram attachments/clips into a run state (pre-process step)."""
     cfg = load_config(args.config)
     state = Path(args.state)
     (state / "attachments").mkdir(parents=True, exist_ok=True)
     file_ids = _parse_file_ids(args.file_ids)
-    if not file_ids:
+    clips = _parse_clips(getattr(args, "clips", ""))
+    if not file_ids and not clips:
         _log("[attach] no file ids")
         return 0
-    from vedit.telegram_client import Telegram
+    if file_ids:
+        from vedit.telegram_client import Telegram
 
-    tg = Telegram()
-    # Numbered names match the bot's "saved image N" confirmations, so the
-    # owner can say "place image 1 at 0:20". Continue past existing ones.
-    start = 0
-    for p in (state / "attachments").iterdir():
-        num = p.name.removeprefix("image-").split(".")[0]
-        if num.isdigit():
-            start = max(start, int(num))
-    for k, fid in enumerate(file_ids, start=start + 1):
-        info = tg.resolve(fid)
-        ext = Path(str(info.get("file_path") or "")).suffix or ".jpg"
-        name = f"image-{k}{ext}"
-        dest = state / "attachments" / name
-        tg.download(fid, dest, cfg.limits.telegram_download_max_bytes)
-        _log(f"[attach] {name} ({dest.stat().st_size} bytes)")
+        tg = Telegram()
+        # Numbered names match the bot's "saved image N" confirmations, so the
+        # owner can say "place image 1 at 0:20". Continue past existing ones.
+        start = 0
+        for p in (state / "attachments").iterdir():
+            num = p.name.removeprefix("image-").split(".")[0]
+            if num.isdigit():
+                start = max(start, int(num))
+        for k, fid in enumerate(file_ids, start=start + 1):
+            info = tg.resolve(fid)
+            ext = Path(str(info.get("file_path") or "")).suffix or ".jpg"
+            name = f"image-{k}{ext}"
+            dest = state / "attachments" / name
+            tg.download(fid, dest, cfg.limits.telegram_download_max_bytes)
+            _log(f"[attach] {name} ({dest.stat().st_size} bytes)")
+    if clips:
+        _attach_clips(state, clips, cfg)
     return 0
 
 
@@ -672,6 +780,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
         if ctx.attachments
         else []
     )
+    clips = _load_clips(ctx)
 
     if args.dry_run:
         preview = fix_stage.preview_fix(
@@ -683,6 +792,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
             screenshots=shots,
             icons_enabled=ctx.cfg.visuals.icons_enabled,
             max_zooms=zoom_cap,
+            clips=clips,
         )
         frame: Path | None = None
         if preview.get("ok") and "input_range_s" in preview:
@@ -726,6 +836,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
                     cfg,
                     mock=ctx.mock,
                     screenshots=shots,
+                    clips=clips,
                 )
                 notes_prefix.append(
                     "re-resolved after plan drift (preview was for an older plan)"
@@ -741,6 +852,7 @@ def cmd_fix(args: argparse.Namespace) -> int:
                 cfg,
                 mock=ctx.mock,
                 screenshots=shots,
+                clips=clips,
             )
         new_plan, notes = fix_stage.apply_patch(
             patch,
@@ -750,6 +862,8 @@ def cmd_fix(args: argparse.Namespace) -> int:
             screenshots=shots,
             max_zooms=zoom_cap,
             presets=set(ctx.cfg.audio.presets or {}),
+            clips=clips,
+            insert_cfg=cfg.inserts,
         )
         notes = notes_prefix + notes
 
@@ -925,6 +1039,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument(
         "--file-ids", required=True, help="JSON array or comma-separated file_ids"
     )
+    a.add_argument("--clips", default="", help="JSON array of inserted-clip specs")
     a.add_argument("--config", default="config.yaml")
     a.set_defaults(func=cmd_attach)
     return parser

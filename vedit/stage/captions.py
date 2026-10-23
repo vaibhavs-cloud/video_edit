@@ -47,7 +47,7 @@ def _srt_time(t: float) -> str:
 
 
 def build_lines(plan: EditPlan, cfg: Config) -> list[CaptionLine]:
-    timeline = TimelineMap(plan.segments)
+    timeline = TimelineMap(plan.segments, plan.inserts, plan.words)
     lines: list[CaptionLine] = []
 
     for span in plan.captions:

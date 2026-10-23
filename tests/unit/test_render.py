@@ -368,3 +368,64 @@ def test_fit_blur_filter_graph_composites(tmp_path, cfg, transcript):
     assert "force_original_aspect_ratio=decrease" in graph
     assert "overlay=x=(W-w)/2:y=(H-h)/2" in graph
     assert "overlay=x=0:y=0:" in graph  # composite placed full-frame
+
+
+def test_encode_insert_cover_fills_reel_and_keeps_audio(tmp_path, cfg):
+    from vedit import ff
+
+    src = _synthetic_segment(tmp_path / "src.mp4", 2.0, 330)
+    out = render._encode_insert(
+        src, tmp_path / "insert.mp4", 0.2, 1.0, False, "cover", cfg
+    )
+    info = ff.probe(out)
+    vs = ff.video_stream(info)
+    assert (vs["width"], vs["height"]) == (cfg.video.width, cfg.video.height)
+    assert any(s.get("codec_type") == "audio" for s in info["streams"])
+    assert ff.duration_of(info) == pytest.approx(1.0, abs=0.12)
+
+
+def test_encode_insert_blur_fit_and_mute(tmp_path, cfg):
+    from vedit import ff
+
+    # 320x240 is far from 9:16 -> adaptive uses the blurred backdrop; muted
+    # clips still get a silent stereo track so concat stays homogeneous.
+    src = _synthetic_segment(tmp_path / "src.mp4", 2.0, 440)
+    out = render._encode_insert(
+        src, tmp_path / "insert.mp4", 0.0, 1.0, True, "adaptive", cfg
+    )
+    info = ff.probe(out)
+    vs = ff.video_stream(info)
+    assert (vs["width"], vs["height"]) == (cfg.video.width, cfg.video.height)
+    audio = [s for s in info["streams"] if s.get("codec_type") == "audio"]
+    assert audio, "silent track keeps every concat input identical"
+    assert ff.duration_of(info) == pytest.approx(1.0, abs=0.12)
+
+
+def test_assemble_pieces_hard_cuts_around_inserts(tmp_path, cfg):
+    from vedit import ff
+
+    src = _synthetic_segment(tmp_path / "src.mp4", 2.0, 550)
+    m1 = render._encode_insert(src, tmp_path / "m1.mp4", 0, 1, True, "cover", cfg)
+    m2 = render._encode_insert(src, tmp_path / "m2.mp4", 1, 1, True, "cover", cfg)
+    ins = render._encode_insert(src, tmp_path / "ins.mp4", 0, 1, False, "cover", cfg)
+
+    joined = render.assemble_pieces(
+        [
+            render.Piece(path=m1, kind="main", seg_index=0),
+            render.Piece(path=m2, kind="main", seg_index=1),
+        ],
+        tmp_path / "work_join",
+        cfg,
+    )
+    assert ff.duration_of(ff.probe(joined)) == pytest.approx(1.9, abs=0.15)
+
+    cut = render.assemble_pieces(
+        [
+            render.Piece(path=m1, kind="main", seg_index=0),
+            render.Piece(path=ins, kind="insert", seg_index=0, insert_index=0),
+            render.Piece(path=m2, kind="main", seg_index=1),
+        ],
+        tmp_path / "work_cut",
+        cfg,
+    )
+    assert ff.duration_of(ff.probe(cut)) == pytest.approx(3.0, abs=0.15)

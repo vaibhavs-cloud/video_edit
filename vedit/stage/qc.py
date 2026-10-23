@@ -9,7 +9,7 @@ from vedit import ff
 from vedit.config import Config
 from vedit.schema import EditPlan
 from vedit.stage.captions import CaptionLine
-from vedit.stage.timeline import TimelineMap
+from vedit.stage.timeline import TimelineMap, crossfade_joins
 
 
 @dataclass
@@ -51,7 +51,7 @@ def run_qc(
     cfg: Config,
 ) -> QcResult:
     result = QcResult()
-    timeline = TimelineMap(plan.segments)
+    timeline = TimelineMap(plan.segments, plan.inserts, plan.words)
     # Crossfade joins blend the boundary frames, shortening the output by one
     # overlap per join vs. the lossless-concat timeline.
     overlap = 0.0
@@ -60,10 +60,13 @@ def run_qc(
             overlap = cfg.cuts.crossfade_video_ms / 1000.0
         elif cfg.cuts.crossfade_audio_ms > 0:
             overlap = cfg.cuts.crossfade_audio_ms / 1000.0
-    expected = max(0.0, timeline.output_dur - (len(plan.segments) - 1) * overlap)
+    joins = crossfade_joins(plan.segments, plan.inserts, plan.words)
+    expected = max(0.0, timeline.output_dur - joins * overlap)
     result.stats = {
         "expected_output_s": round(expected, 3),
         "segments": len(plan.segments),
+        "inserts": len(plan.inserts),
+        "crossfade_joins": joins,
         "crossfade_overlap_s": round(overlap, 3),
         "visuals_planned": len(plan.visuals),
         "visuals_resolved": len(resolved_assets),

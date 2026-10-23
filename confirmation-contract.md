@@ -18,7 +18,11 @@ preview instantly (`kind=fix-dryrun`, exactDK instruction strings, e.g.
 `preset punchy`); `/apply` `/reject` `/redo <sha8>` `/deliver` `/status`
 `/list` `/cancel` manage the conversation; `/new` collects the video (link =
 Drive URL, direct <20MB upload), `/addimage` stages photos (caption time
-optional), `/build` (or plain `done`) starts the run; `/editimage [N]` opens
+optional), `/addvideo` stages inserted clips (caption `at 0:20 for 5s`,
+`from 0:03`, `mute`), `/build` (or plain `done`) starts the run with
+`attachments` + `clips`; `/place video 1 at 0:20 for 5s` → `insert_video
+video 1 at 0:20 for 5s`, `/move video 1 to 0:40` → `retime_insert video 1
+to 0:40`, `/remove video 1` → `remove_insert video 1`. `/editimage [N]` opens
 an aspect/crop/size menu whose buttons emit exact directives
 (`set_visual_mode image-3 cover crop top`, `resize image-1 to 60%`,
 `preset clean_voice`) parsed by `vedit.stage.fix.parse_directive` with no
@@ -89,7 +93,8 @@ apply".
     "segments_before": 12, "segments_after": 13,
     "visuals_removed": ["v4"], "visuals_added": [],
     "captions_before": 40, "captions_after": 37,
-    "zooms_before": 2, "zooms_after": 2
+    "zooms_before": 2, "zooms_after": 2,
+    "inserts_before": 1, "inserts_after": 2
   },
   "duration": {"before_s": 55.0, "after_s": 40.2},
   "notes": ["cut words 143..160 from segment …", "…"],

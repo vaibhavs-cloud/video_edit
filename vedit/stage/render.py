@@ -617,6 +617,362 @@ def concat_crossfade(paths: list[Path], workdir: Path, cfg: Config) -> Path:
     return out
 
 
+# ---------- inserted clips ----------
+
+
+@dataclass(frozen=True)
+class Piece:
+    path: Path
+    kind: str  # "main" | "insert"
+    seg_index: int = -1
+    insert_index: int = -1
+
+
+def _insert_source(plan: EditPlan, state_dir: Path, index: int) -> Path:
+    src = state_dir / plan.inserts[index].file
+    if not src.exists() or src.stat().st_size == 0:
+        raise RenderError(
+            f"insert {plan.inserts[index].id}: clip missing from state "
+            f"({plan.inserts[index].file}) — resend it and retry"
+        )
+    return src
+
+
+def _insert_fingerprint(
+    src: Path,
+    trim_start: float,
+    duration: float,
+    muted: bool,
+    fit: str,
+    cfg: Config,
+) -> str:
+    h = hashlib.sha256()
+    try:
+        st = src.stat()
+        tag = f"{st.st_size}:{st.st_mtime_ns}"
+    except OSError:
+        tag = "missing"
+    v = cfg.video
+    h.update(
+        repr(
+            (
+                str(src),
+                tag,
+                round(trim_start, 3),
+                round(duration, 3),
+                muted,
+                fit,
+                v.width,
+                v.height,
+                v.fps,
+                v.x264_preset,
+                v.x264_crf,
+                v.audio_bitrate,
+            )
+        ).encode()
+    )
+    h.update(cfg.hash.encode())
+    return h.hexdigest()[:16]
+
+
+def _encode_insert(
+    src: Path,
+    out: Path,
+    trim_start: float,
+    duration: float,
+    muted: bool,
+    fit: str,
+    cfg: Config,
+) -> Path:
+    W, H = cfg.video.width, cfg.video.height
+    fps = cfg.video.fps
+    info = ff.probe(src)
+    has_audio = any(s.get("codec_type") == "audio" for s in info.get("streams", []))
+    keep_audio = has_audio and not muted
+
+    use_blur = False
+    if fit != "cover":
+        vs = ff.video_stream(info)
+        ar = float(vs.get("width") or 1) / max(1, float(vs.get("height") or 1))
+        reel_ar = W / H
+        use_blur = abs(ar - reel_ar) / reel_ar > 0.25
+
+    args = ["-y", "-ss", f"{max(0.0, trim_start):.3f}", "-i", str(src)]
+    if not keep_audio:
+        args += [
+            "-f",
+            "lavfi",
+            "-t",
+            f"{duration:.3f}",
+            "-i",
+            "anullsrc=channel_layout=stereo:sample_rate=48000",
+        ]
+
+    if use_blur:
+        blur = max(8, min(W, H) // 24)
+        graph = (
+            f"[0:v]split[bg][fg];"
+            f"[bg]scale={W}:{H}:force_original_aspect_ratio=increase:"
+            f"flags=lanczos,crop={W}:{H},gblur=sigma={blur}[bgv];"
+            f"[fg]scale={W}:{H}:force_original_aspect_ratio=decrease:"
+            f"flags=lanczos[fgv];"
+            f"[bgv][fgv]overlay=x=(W-w)/2:y=(H-h)/2,"
+            f"fps={fps},setsar=1[vout]"
+        )
+    else:
+        graph = (
+            f"[0:v]scale={W}:{H}:force_original_aspect_ratio=increase:"
+            f"flags=lanczos,crop={W}:{H},fps={fps},setsar=1[vout]"
+        )
+    audio_label = "1:a"
+    if keep_audio:
+        graph += (
+            f";[0:a]atrim=0:{duration:.3f},asetpts=PTS-STARTPTS,"
+            f"afade=t=in:d=0.01,"
+            f"afade=t=out:st={max(0.0, duration - 0.01):.3f}:d=0.01[aout]"
+        )
+        audio_label = "[aout]"
+
+    args += [
+        "-filter_complex",
+        graph,
+        "-map",
+        "[vout]",
+        "-map",
+        audio_label,
+        "-t",
+        f"{duration:.3f}",
+        "-c:v",
+        "libx264",
+        "-preset",
+        cfg.video.x264_preset,
+        "-crf",
+        str(cfg.video.x264_crf),
+        "-pix_fmt",
+        "yuv420p",
+        "-r",
+        str(fps),
+        "-c:a",
+        "aac",
+        "-b:a",
+        cfg.video.audio_bitrate,
+        "-ar",
+        "48000",
+        "-shortest",
+        str(out),
+    ]
+    ff.ffmpeg(args)
+    return out
+
+
+def render_inserts(
+    plan: EditPlan,
+    state_dir: Path,
+    workdir: Path,
+    cfg: Config,
+) -> dict[int, Path]:
+    """Encode every inserted clip once (trim + fit + audio policy)."""
+    ins_dir = workdir / "inserts"
+    ins_dir.mkdir(parents=True, exist_ok=True)
+    out: dict[int, Path] = {}
+    for i, ins in enumerate(plan.inserts):
+        src = _insert_source(plan, state_dir, i)
+        dest = ins_dir / f"insert_{i:02d}.mp4"
+        sidecar = dest.with_suffix(".mp4.json")
+        fingerprint = _insert_fingerprint(
+            src, ins.trim_start, ins.duration, ins.muted, ins.fit, cfg
+        )
+        if dest.exists() and dest.stat().st_size > 0 and sidecar.exists():
+            try:
+                if (
+                    json.loads(sidecar.read_text(encoding="utf-8")).get("fp")
+                    == fingerprint
+                ):
+                    out[i] = dest
+                    continue
+            except (OSError, ValueError):
+                pass
+            dest.unlink(missing_ok=True)
+        _encode_insert(
+            src,
+            dest,
+            ins.trim_start,
+            ins.duration,
+            ins.muted,
+            ins.fit,
+            cfg,
+        )
+        sidecar.write_text(json.dumps({"fp": fingerprint}), encoding="utf-8")
+        out[i] = dest
+    return out
+
+
+def _segment_tokens(
+    plan: EditPlan, seg_index: int
+) -> list[tuple[str, float, float, int]]:
+    """Ordered tokens for one segment: ('main', a, b, -1) / ('insert', -1, -1, i)."""
+    seg = plan.segments[seg_index]
+    anchored = [
+        (plan.insert_anchor_s(ins), i)
+        for i, ins in enumerate(plan.inserts)
+        if ins.from_word < len(plan.words)
+        if plan.segment_of_word(ins.from_word) == seg_index
+    ]
+    if not anchored:
+        return [("main", seg.start, seg.end, -1)]
+
+    at_start = [i for a, i in sorted(anchored) if a <= seg.start + 1e-6]
+    at_end = [i for a, i in sorted(anchored) if a >= seg.end - 1e-6]
+    inside = sorted(
+        (a, i) for a, i in anchored if seg.start + 1e-6 < a < seg.end - 1e-6
+    )
+    tokens: list[tuple[str, float, float, int]] = [
+        ("insert", -1.0, -1.0, i) for i in at_start
+    ]
+    cursor = seg.start
+    for anchor, i in inside:
+        if anchor - cursor > 0.05:
+            tokens.append(("main", cursor, anchor, -1))
+        tokens.append(("insert", -1.0, -1.0, i))
+        cursor = anchor
+    if seg.end - cursor > 0.05:
+        tokens.append(("main", cursor, seg.end, -1))
+    tokens.extend(("insert", -1.0, -1.0, i) for i in at_end)
+    return tokens
+
+
+def render_pieces(
+    plan: EditPlan,
+    resolved: list[ResolvedVisual],
+    base: Path,
+    clean_audio: Path,
+    state_dir: Path,
+    workdir: Path,
+    cfg: Config,
+) -> list[Piece]:
+    """Render main windows + inserted clips into a single ordered piece list."""
+    seg_dir = workdir / "segments"
+    seg_dir.mkdir(parents=True, exist_ok=True)
+    insert_paths = render_inserts(plan, state_dir, workdir, cfg)
+    max_zoom = max(1, len(plan.segments) // cfg.video.max_zoom_segments_div)
+
+    token_lists = [_segment_tokens(plan, i) for i in range(len(plan.segments))]
+    zoom_flags: dict[int, bool] = {}
+    zoomed_total = 0
+    for i, seg in enumerate(plan.segments):
+        want_zoom = any(
+            seg.keep_from_word <= z <= seg.keep_to_word for z in plan.zoom_at_words
+        )
+        if want_zoom and zoomed_total < max_zoom:
+            zoom_flags[i] = True
+            zoomed_total += 1
+        else:
+            zoom_flags[i] = False
+
+    jobs: list[tuple[Path, float, float, list[OverlayPlan], bool, Path, str]] = []
+    for i, tokens in enumerate(token_lists):
+        mains = [t for t in tokens if t[0] == "main"]
+        for k, (_, start, end, _) in enumerate(mains):
+            out = seg_dir / f"seg_{i:03d}_{k:02d}.mp4"
+            overlays = _overlays_for_segment(start, end, resolved, plan, cfg)
+            fp = _segment_fingerprint(
+                start, end, overlays, zoom_flags[i], base, clean_audio, cfg
+            )
+            jobs.append((base, start, end, overlays, zoom_flags[i], out, fp))
+
+    rendered: dict[Path, Path] = {}
+
+    def _run(
+        job: tuple[Path, float, float, list[OverlayPlan], bool, Path, str],
+    ) -> Path:
+        _base, start, end, overlays, zoom, out, fingerprint = job
+        sidecar = out.with_suffix(".mp4.json")
+        if out.exists() and out.stat().st_size > 0 and sidecar.exists():
+            try:
+                if (
+                    json.loads(sidecar.read_text(encoding="utf-8")).get("fp")
+                    == fingerprint
+                ):
+                    return out
+            except (OSError, ValueError):
+                pass
+            out.unlink(missing_ok=True)
+        _encode_one_segment(base, clean_audio, start, end, overlays, zoom, out, cfg)
+        sidecar.write_text(json.dumps({"fp": fingerprint}), encoding="utf-8")
+        return out
+
+    workers = max(1, min(cfg.video.encode_workers, len(jobs) or 1))
+    if workers < 2:
+        for job in jobs:
+            rendered[job[5]] = _run(job)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for job, path in zip(jobs, pool.map(_run, jobs), strict=True):
+                rendered[job[5]] = path
+
+    pieces: list[Piece] = []
+    for i, tokens in enumerate(token_lists):
+        k = 0
+        for kind, _start, _end, ins_idx in tokens:
+            if kind == "insert":
+                pieces.append(
+                    Piece(
+                        path=insert_paths[ins_idx],
+                        kind="insert",
+                        seg_index=i,
+                        insert_index=ins_idx,
+                    )
+                )
+                continue
+            out = seg_dir / f"seg_{i:03d}_{k:02d}.mp4"
+            pieces.append(Piece(path=rendered[out], kind="main", seg_index=i))
+            k += 1
+    for i, ins in enumerate(plan.inserts):
+        if ins.from_word >= len(plan.words):
+            pieces.append(
+                Piece(
+                    path=insert_paths[i],
+                    kind="insert",
+                    seg_index=len(plan.segments) - 1,
+                    insert_index=i,
+                )
+            )
+    return pieces
+
+
+def assemble_pieces(pieces: list[Piece], workdir: Path, cfg: Config) -> Path:
+    """Crossfade within main runs, hard-cut everything around inserted clips."""
+    if not pieces:
+        raise RenderError("no pieces to assemble")
+    chunks: list[Path] = []
+    run: list[Path] = []
+    run_idx = 0
+
+    def flush_run() -> None:
+        nonlocal run, run_idx
+        if not run:
+            return
+        run_dir = workdir / "runs" / f"run_{run_idx:02d}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        chunks.append(concat_crossfade(run, run_dir, cfg))
+        run = []
+        run_idx += 1
+
+    for piece in pieces:
+        if piece.kind == "main":
+            run.append(piece.path)
+            continue
+        flush_run()
+        chunks.append(piece.path)
+    flush_run()
+
+    if len(chunks) == 1:
+        return chunks[0]
+    out_dir = workdir / "assembled"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return concat(chunks, out_dir)
+
+
 def burn_captions(
     concat_mp4: Path, workdir: Path, fonts_dir: Path, out_path: Path, cfg: Config
 ) -> Path:

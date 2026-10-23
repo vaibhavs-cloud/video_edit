@@ -24,6 +24,10 @@ on:
         description: "JSON array of screenshot file_ids"
         type: string
         default: "[]"
+      clips:
+        description: "JSON array of inserted-video specs (file_id, at, duration, ...)"
+        type: string
+        default: "[]"
       prompt:
         description: "Owner instruction for the edit"
         type: string
@@ -133,6 +137,13 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           ATTACHMENTS: ${{ inputs.attachments }}
         run: python -m vedit attach --state out/run --file-ids "$ATTACHMENTS"
+
+      - name: Download inserted clips
+        if: inputs.clips != '' && inputs.clips != '[]'
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CLIPS: ${{ inputs.clips }}
+        run: python -m vedit attach --state out/run --file-ids "[]" --clips "$CLIPS"
 
       - name: Run pipeline
         id: run
@@ -291,6 +302,7 @@ jobs:
             out/run/.done.plan
             out/run/icons/**
             out/run/attachments/**
+            out/run/inserts/**
 
       - name: Upload preview artifact (kind=fix-dryrun)
         if: steps.run.outcome == 'success' && inputs.kind == 'fix-dryrun'

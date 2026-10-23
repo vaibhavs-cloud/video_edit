@@ -68,7 +68,7 @@ def write_report(
     notes: list[str],
     input_ref: str,
 ) -> Path:
-    timeline = TimelineMap(plan.segments)
+    timeline = TimelineMap(plan.segments, plan.inserts, plan.words)
     lines = [
         "# Edit report",
         "",

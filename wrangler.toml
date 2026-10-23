@@ -1,0 +1,12 @@
+name = "vedit-relay"
+main = "infra/worker.mjs"
+compatibility_date = "2026-09-01"
+keep_vars = true
+
+[[kv_namespaces]]
+binding = "PENDING_IMAGES"
+id = "f7c38d3fb974456d97783e2c41c61318"
+
+[vars]
+GH_OWNER = "vaibhavs-cloud"
+GH_REPO = "video_edit"
